@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "memorión",
+  "productName": "MEMORIÓN",
   "version": "0.1.0",
   "identifier": "com.andre.memorión",
   "build": {
@@ -12,9 +12,11 @@
   "app": {
     "windows": [
       {
-        "title": "memorión",
-        "width": 800,
-        "height": 600
+        "title": "MEMORIÓN",
+        "width": 1180,
+        "height": 760,
+        "minWidth": 900,
+        "minHeight": 620
       }
     ],
     "security": {

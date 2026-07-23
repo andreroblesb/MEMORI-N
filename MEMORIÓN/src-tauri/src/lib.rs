@@ -1,7 +1,10 @@
+mod database;
+
+use database::{Database, DatabaseStatus};
 use serde::Serialize;
 use std::{collections::HashMap, sync::Mutex};
 use sysinfo::System;
-use tauri::State;
+use tauri::{Manager, State};
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,9 +45,24 @@ impl Default for AppState {
         Self {
             memory: Mutex::new(MemoryState {
                 folders: vec![
-                    FolderChat { id: 1, name: "Investigación".into(), count: 0, color: "violet".into() },
-                    FolderChat { id: 2, name: "Universidad".into(), count: 0, color: "blue".into() },
-                    FolderChat { id: 3, name: "Ideas de producto".into(), count: 0, color: "teal".into() },
+                    FolderChat {
+                        id: 1,
+                        name: "Investigación".into(),
+                        count: 0,
+                        color: "violet".into(),
+                    },
+                    FolderChat {
+                        id: 2,
+                        name: "Universidad".into(),
+                        count: 0,
+                        color: "blue".into(),
+                    },
+                    FolderChat {
+                        id: 3,
+                        name: "Ideas de producto".into(),
+                        count: 0,
+                        color: "teal".into(),
+                    },
                 ],
                 messages: HashMap::new(),
                 next_folder_id: 4,
@@ -60,7 +78,10 @@ fn chat_key(folder_id: Option<u64>) -> String {
 
 #[tauri::command]
 fn list_folder_chats(state: State<'_, AppState>) -> Result<Vec<FolderChat>, String> {
-    let memory = state.memory.lock().map_err(|_| "No fue posible acceder al estado".to_string())?;
+    let memory = state
+        .memory
+        .lock()
+        .map_err(|_| "No fue posible acceder al estado".to_string())?;
     Ok(memory.folders.clone())
 }
 
@@ -70,8 +91,16 @@ fn create_folder_chat(name: String, state: State<'_, AppState>) -> Result<Folder
     if clean_name.is_empty() {
         return Err("El nombre no puede estar vacío".into());
     }
-    let mut memory = state.memory.lock().map_err(|_| "No fue posible acceder al estado".to_string())?;
-    let folder = FolderChat { id: memory.next_folder_id, name: clean_name.into(), count: 0, color: "grape".into() };
+    let mut memory = state
+        .memory
+        .lock()
+        .map_err(|_| "No fue posible acceder al estado".to_string())?;
+    let folder = FolderChat {
+        id: memory.next_folder_id,
+        name: clean_name.into(),
+        count: 0,
+        color: "grape".into(),
+    };
     memory.next_folder_id += 1;
     memory.folders.push(folder.clone());
     Ok(folder)
@@ -79,7 +108,10 @@ fn create_folder_chat(name: String, state: State<'_, AppState>) -> Result<Folder
 
 #[tauri::command]
 fn delete_folder_chat(id: u64, state: State<'_, AppState>) -> Result<bool, String> {
-    let mut memory = state.memory.lock().map_err(|_| "No fue posible acceder al estado".to_string())?;
+    let mut memory = state
+        .memory
+        .lock()
+        .map_err(|_| "No fue posible acceder al estado".to_string())?;
     let previous_len = memory.folders.len();
     memory.folders.retain(|folder| folder.id != id);
     memory.messages.remove(&chat_key(Some(id)));
@@ -87,20 +119,40 @@ fn delete_folder_chat(id: u64, state: State<'_, AppState>) -> Result<bool, Strin
 }
 
 #[tauri::command]
-fn get_messages(folder_id: Option<u64>, state: State<'_, AppState>) -> Result<Vec<ChatMessage>, String> {
-    let memory = state.memory.lock().map_err(|_| "No fue posible acceder al estado".to_string())?;
-    Ok(memory.messages.get(&chat_key(folder_id)).cloned().unwrap_or_default())
+fn get_messages(
+    folder_id: Option<u64>,
+    state: State<'_, AppState>,
+) -> Result<Vec<ChatMessage>, String> {
+    let memory = state
+        .memory
+        .lock()
+        .map_err(|_| "No fue posible acceder al estado".to_string())?;
+    Ok(memory
+        .messages
+        .get(&chat_key(folder_id))
+        .cloned()
+        .unwrap_or_default())
 }
 
 #[tauri::command]
-fn send_message(folder_id: Option<u64>, content: String, state: State<'_, AppState>) -> Result<Vec<ChatMessage>, String> {
+fn send_message(
+    folder_id: Option<u64>,
+    content: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<ChatMessage>, String> {
     let clean_content = content.trim();
     if clean_content.is_empty() {
         return Err("El mensaje no puede estar vacío".into());
     }
-    let mut memory = state.memory.lock().map_err(|_| "No fue posible acceder al estado".to_string())?;
+    let mut memory = state
+        .memory
+        .lock()
+        .map_err(|_| "No fue posible acceder al estado".to_string())?;
     let messages = memory.messages.entry(chat_key(folder_id)).or_default();
-    messages.push(ChatMessage { role: "user".into(), content: clean_content.into() });
+    messages.push(ChatMessage {
+        role: "user".into(),
+        content: clean_content.into(),
+    });
     messages.push(ChatMessage {
         role: "assistant".into(),
         content: "Recibí tu mensaje desde el backend de MEMORIÓN. En esta primera fase puedo conservar la conversación mientras la aplicación permanezca abierta.".into(),
@@ -116,7 +168,10 @@ fn send_message(folder_id: Option<u64>, content: String, state: State<'_, AppSta
 
 #[tauri::command]
 fn get_system_metrics(state: State<'_, AppState>) -> Result<SystemMetrics, String> {
-    let mut system = state.system.lock().map_err(|_| "No fue posible leer los recursos del sistema".to_string())?;
+    let mut system = state
+        .system
+        .lock()
+        .map_err(|_| "No fue posible leer los recursos del sistema".to_string())?;
     system.refresh_cpu_usage();
     system.refresh_memory();
     Ok(SystemMetrics {
@@ -126,18 +181,70 @@ fn get_system_metrics(state: State<'_, AppState>) -> Result<SystemMetrics, Strin
     })
 }
 
+#[tauri::command]
+fn get_database_status(database: State<'_, Database>) -> Result<DatabaseStatus, String> {
+    database.status()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
+        .setup(|app| {
+            let database = Database::open(app.handle())
+                .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+            app.manage(database);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             list_folder_chats,
             create_folder_chat,
             delete_folder_chat,
             get_messages,
             send_message,
-            get_system_metrics
+            get_system_metrics,
+            get_database_status,
+            database::create_folder,
+            database::get_folder,
+            database::list_folders,
+            database::update_folder,
+            database::delete_folder,
+            database::create_document,
+            database::get_document,
+            database::list_documents,
+            database::update_document,
+            database::delete_document,
+            database::attach_document,
+            database::create_knowledge_origin,
+            database::get_knowledge_origin,
+            database::list_knowledge_origins,
+            database::update_knowledge_origin,
+            database::delete_knowledge_origin,
+            database::create_knowledge_item,
+            database::get_knowledge_item,
+            database::list_knowledge_items,
+            database::update_knowledge_item,
+            database::delete_knowledge_item,
+            database::create_ai_model,
+            database::get_ai_model,
+            database::list_ai_models,
+            database::update_ai_model,
+            database::delete_ai_model,
+            database::upsert_model_capability,
+            database::get_model_capability,
+            database::list_model_capabilities,
+            database::delete_model_capability,
+            database::create_model_assignment,
+            database::get_model_assignment,
+            database::list_model_assignments,
+            database::update_model_assignment,
+            database::delete_model_assignment,
+            database::upsert_knowledge_vector,
+            database::get_knowledge_vector,
+            database::delete_knowledge_vector,
+            database::search_knowledge
         ])
         .run(tauri::generate_context!())
         .expect("error while running MEMORIÓN");

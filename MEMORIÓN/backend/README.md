@@ -28,6 +28,11 @@ son:
 - `GET /api/models/status`
 - `GET /api/models/events` (Server-Sent Events)
 - `POST /api/models/retry`
+- `POST /api/chat`
+
+`POST /api/chat` recibe el historial visible con roles `user` y `assistant` y
+devuelve una respuesta del modelo conversacional. En esta fase no persiste el
+historial, no extrae conocimientos y no genera embeddings.
 
 El progreso aparece en la misma consola de Uvicorn y se conserva en:
 

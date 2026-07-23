@@ -30,6 +30,25 @@ button { font: inherit; }
 .message.assistant { flex-direction: row; }.message.user { flex-direction: row-reverse; }
 .message-bubble { max-width: 650px; padding: 13px 16px; border: 1px solid #2a2c35; background: #171820; }
 .message.user .message-bubble { background: #2c2342; border-color: #443563; }
+.markdown-message { color: #e8e8ef; font-size: 14px; line-height: 1.7; overflow-wrap: anywhere; }
+.markdown-message > :first-child { margin-top: 0; }
+.markdown-message > :last-child { margin-bottom: 0; }
+.markdown-message p, .markdown-message ul, .markdown-message ol, .markdown-message blockquote, .markdown-message pre, .markdown-message table { margin: .65em 0; }
+.markdown-message h1, .markdown-message h2, .markdown-message h3, .markdown-message h4 { margin: 1em 0 .45em; color: #f5f3ff; line-height: 1.25; }
+.markdown-message h1 { font-size: 1.5em; }.markdown-message h2 { font-size: 1.3em; }.markdown-message h3 { font-size: 1.15em; }
+.markdown-message ul, .markdown-message ol { padding-left: 1.5em; }
+.markdown-message li + li { margin-top: .25em; }
+.markdown-message a { color: #a78bfa; text-decoration: underline; text-underline-offset: 2px; }
+.markdown-message blockquote { margin-left: 0; padding: .2em 0 .2em 1em; color: #b7b7c4; border-left: 3px solid #6d4bc3; }
+.markdown-message code { padding: .15em .38em; border-radius: 5px; color: #ddd6fe; background: #25222f; font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace; font-size: .9em; }
+.markdown-message pre { max-width: 100%; padding: 13px 15px; overflow-x: auto; border: 1px solid #30323d; border-radius: 9px; background: #0e0f14; }
+.markdown-message pre code { padding: 0; color: #e5e7eb; background: transparent; }
+.markdown-message table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; }
+.markdown-message th, .markdown-message td { min-width: 90px; padding: 7px 10px; border: 1px solid #373945; text-align: left; }
+.markdown-message th { color: #f1edff; background: #27232f; }
+.markdown-message tr:nth-child(even) td { background: rgba(255,255,255,.025); }
+.markdown-message hr { margin: 1em 0; border: 0; border-top: 1px solid #343641; }
+.markdown-message input[type="checkbox"] { accent-color: #8b5cf6; }
 .content-scroll { height: calc(100vh - 60px); }
 .content-container { width: min(1100px, calc(100% - 64px)); margin: 0 auto; padding: 44px 0 80px; }
 .folder-card { cursor: pointer; min-height: 160px; transition: .2s ease; }.folder-card:hover { border-color: #594481; transform: translateY(-2px); }

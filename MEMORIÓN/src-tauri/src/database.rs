@@ -10,6 +10,7 @@ use tauri::{AppHandle, Manager};
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_initial.sql");
 const VECTOR_INTEGRITY_MIGRATION: &str = include_str!("../migrations/0002_vector_integrity.sql");
 const DOCUMENT_SOURCES_MIGRATION: &str = include_str!("../migrations/0003_document_sources.sql");
+const SESSION_MESSAGES_MIGRATION: &str = include_str!("../migrations/0004_session_messages.sql");
 pub const EMBEDDING_DIMENSIONS: u32 = 768;
 
 static REGISTER_SQLITE_VEC: Once = Once::new();
@@ -17,6 +18,14 @@ static REGISTER_SQLITE_VEC: Once = Once::new();
 pub struct Database {
     connection: Mutex<Connection>,
     path: PathBuf,
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        if let Ok(connection) = self.connection.get_mut() {
+            let _ = connection.execute("DELETE FROM session_message", []);
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -33,11 +42,14 @@ impl Database {
     pub fn open(app: &AppHandle) -> Result<Self, String> {
         let data_dir = app
             .path()
-            .app_data_dir()
+            .local_data_dir()
             .map_err(|error| format!("No fue posible resolver el directorio de datos: {error}"))?;
+        let data_dir = data_dir.join("MEMORIÓN").join("data");
         std::fs::create_dir_all(&data_dir)
             .map_err(|error| format!("No fue posible crear el directorio de datos: {error}"))?;
-        Self::open_path(data_dir.join("memorion.sqlite3"))
+        let database_path = data_dir.join("memorion.sqlite3");
+        eprintln!("SQLite de MEMORIÓN: {}", database_path.display());
+        Self::open_path(database_path)
     }
 
     fn open_path(path: PathBuf) -> Result<Self, String> {
@@ -53,6 +65,9 @@ impl Database {
         configure_connection(&connection)?;
         migrate(&connection)?;
         verify_database(&connection)?;
+        connection
+            .execute("DELETE FROM session_message", [])
+            .map_err(|error| format!("No fue posible limpiar el historial de sesión: {error}"))?;
 
         Ok(Self {
             connection: Mutex::new(connection),
@@ -113,7 +128,7 @@ fn migrate(connection: &Connection) -> Result<(), String> {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| format!("No fue posible leer la versión del esquema: {error}"))?;
 
-    match version {
+    let migrations_result = match version {
         0 => {
             connection
                 .execute_batch(INITIAL_MIGRATION)
@@ -136,10 +151,18 @@ fn migrate(connection: &Connection) -> Result<(), String> {
         2 => connection
             .execute_batch(DOCUMENT_SOURCES_MIGRATION)
             .map_err(|error| format!("Falló la migración de fuentes documentales: {error}")),
-        3 => Ok(()),
+        3 | 4 => Ok(()),
         other => Err(format!(
             "La base de datos usa una versión de esquema no compatible: {other}"
         )),
+    };
+    migrations_result?;
+    if version < 4 {
+        connection
+            .execute_batch(SESSION_MESSAGES_MIGRATION)
+            .map_err(|error| format!("Falló la migración del historial de sesión: {error}"))
+    } else {
+        Ok(())
     }
 }
 
@@ -185,7 +208,7 @@ mod tests {
     fn initial_schema_and_vec_extension_are_available() {
         let (database, path) = temporary_database("schema-test");
         let status = database.status().expect("status should be readable");
-        assert_eq!(status.schema_version, 3);
+        assert_eq!(status.schema_version, 4);
         assert_eq!(status.embedding_dimensions, 768);
 
         drop(database);

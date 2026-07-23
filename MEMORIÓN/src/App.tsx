@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
@@ -10,6 +10,7 @@ import {
   Card,
   Center,
   Group,
+  Loader,
   Modal,
   Paper,
   ScrollArea,
@@ -38,6 +39,8 @@ import {
   IconX,
 } from "@tabler/icons-react";
 import "./App.css";
+import { MarkdownMessage } from "./components/MarkdownMessage";
+import { completeChat } from "./services/chatApi";
 
 type View = "chat" | "analytics";
 type Folder = {
@@ -72,10 +75,13 @@ function App() {
   const [folderError, setFolderError] = useState("");
   const [prompt, setPrompt] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
+  const [chatBusy, setChatBusy] = useState(false);
+  const [chatError, setChatError] = useState("");
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [attachmentBusy, setAttachmentBusy] = useState(false);
   const [attachmentError, setAttachmentError] = useState("");
   const [search, setSearch] = useState("");
+  const selectedFolderRef = useRef<number | null>(null);
 
   const activeFolder = useMemo(
     () => folders.find((folder) => folder.id === selectedFolder),
@@ -87,13 +93,16 @@ function App() {
     Promise.all([
       invoke<Folder[]>("list_folders"),
       invoke<DocumentRecord[]>("list_documents", { scope: "general", folderId: null }),
-    ]).then(([nextFolders, nextDocuments]) => {
+      invoke<Message[]>("list_session_messages", { folderId: null }),
+    ]).then(([nextFolders, nextDocuments, nextMessages]) => {
       setFolders(nextFolders);
       setDocuments(nextDocuments);
+      setMessages(nextMessages);
     }).catch((error) => setFolderError(String(error)));
   }, []);
 
   const openChat = async (folderId: number | null) => {
+    selectedFolderRef.current = folderId;
     setSelectedFolder(folderId);
     setView("chat");
     if (!inTauri()) {
@@ -103,7 +112,7 @@ function App() {
     }
     try {
       const [nextMessages, nextDocuments] = await Promise.all([
-        invoke<Message[]>("get_messages", { folderId }),
+        invoke<Message[]>("list_session_messages", { folderId }),
         invoke<DocumentRecord[]>("list_documents", {
           scope: folderId === null ? "general" : "folder",
           folderId,
@@ -120,18 +129,37 @@ function App() {
 
   const submitPrompt = async (value = prompt) => {
     const clean = value.trim();
-    if (!clean) return;
+    if (!clean || chatBusy) return;
+    const targetFolder = selectedFolder;
+    const nextMessages: Message[] = [...messages, { role: "user", content: clean }];
     setPrompt("");
-    if (inTauri()) {
-      try {
-        const result = await invoke<Message[]>("send_message", { folderId: selectedFolder, content: clean });
-        setMessages(result);
-        return;
-      } catch (error) {
-        console.error(error);
+    setChatError("");
+    setChatBusy(true);
+    setMessages(nextMessages);
+    try {
+      if (inTauri()) {
+        await invoke("append_session_message", {
+          folderId: targetFolder,
+          role: "user",
+          content: clean,
+        });
       }
+      const content = await completeChat(nextMessages);
+      if (inTauri()) {
+        await invoke("append_session_message", {
+          folderId: targetFolder,
+          role: "assistant",
+          content,
+        });
+      }
+      if (selectedFolderRef.current === targetFolder) {
+        setMessages((current) => [...current, { role: "assistant", content }]);
+      }
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setChatBusy(false);
     }
-    setMessages((current) => [...current, { role: "user", content: clean }, { role: "assistant", content: "Mensaje recibido en el modo de demostración del frontend." }]);
   };
 
   const selectFolder = async () => {
@@ -165,6 +193,7 @@ function App() {
     }
     setFolders((current) => current.filter((folder) => folder.id !== id));
     if (selectedFolder === id) {
+      selectedFolderRef.current = null;
       setSelectedFolder(null);
       setMessages([]);
       setView("chat");
@@ -284,15 +313,28 @@ function App() {
                       <Avatar size={34} radius="xl" color={message.role === "assistant" ? "violet" : "gray"}>
                         {message.role === "assistant" ? <IconMessage size={17} /> : <IconUser size={17} />}
                       </Avatar>
-                      <Paper className="message-bubble"><Text size="sm" lh={1.7}>{message.content}</Text></Paper>
+                      <Paper className="message-bubble">
+                        {message.role === "assistant"
+                          ? <MarkdownMessage content={message.content} />
+                          : <Text size="sm" lh={1.7}>{message.content}</Text>}
+                      </Paper>
                     </Group>
                   ))}
+                  {chatBusy && (
+                    <Group align="flex-start" wrap="nowrap" className="message assistant">
+                      <Avatar size={34} radius="xl" color="violet"><IconMessage size={17} /></Avatar>
+                      <Paper className="message-bubble">
+                        <Group gap="xs"><Loader size="xs" color="violet" /><Text size="sm" c="dimmed">Pensando…</Text></Group>
+                      </Paper>
+                    </Group>
+                  )}
                 </Stack>
               </ScrollArea>
             )}
             <Composer prompt={prompt} setPrompt={setPrompt} submitPrompt={submitPrompt}
               documents={documents} attachDocument={attachDocument} removeDocument={removeDocument}
-              attachmentBusy={attachmentBusy} attachmentError={attachmentError} />
+              attachmentBusy={attachmentBusy} attachmentError={attachmentError}
+              chatBusy={chatBusy} chatError={chatError} />
           </section>
         )}
 
@@ -319,7 +361,7 @@ function App() {
   );
 }
 
-function Composer({ prompt, setPrompt, submitPrompt, documents, attachDocument, removeDocument, attachmentBusy, attachmentError }: {
+function Composer({ prompt, setPrompt, submitPrompt, documents, attachDocument, removeDocument, attachmentBusy, attachmentError, chatBusy, chatError }: {
   prompt: string;
   setPrompt: (value: string) => void;
   submitPrompt: () => void;
@@ -328,6 +370,8 @@ function Composer({ prompt, setPrompt, submitPrompt, documents, attachDocument, 
   removeDocument: (id: number) => void;
   attachmentBusy: boolean;
   attachmentError: string;
+  chatBusy: boolean;
+  chatError: string;
 }) {
   return (
     <div className="composer-wrap">
@@ -338,10 +382,11 @@ function Composer({ prompt, setPrompt, submitPrompt, documents, attachDocument, 
             <ActionIcon variant="transparent" color="gray" size="xs" aria-label={`Quitar ${document.relativePath}`} onClick={() => removeDocument(document.id)}><IconX size={12} /></ActionIcon>
           </Paper>)}
         </Group>}
-        <Textarea value={prompt} onChange={(event) => setPrompt(event.currentTarget.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); submitPrompt(); } }} placeholder="Pregunta, crea o explora una idea..." aria-label="Mensaje" autosize minRows={1} maxRows={4} variant="unstyled" />
-        <Group justify="space-between" mt="xs"><ActionIcon variant="subtle" color="gray" aria-label="Adjuntar archivo" onClick={attachDocument} loading={attachmentBusy}><IconPlus size={19} /></ActionIcon><ActionIcon size="lg" radius="md" color="violet" aria-label="Enviar mensaje" onClick={submitPrompt} disabled={!prompt.trim()}><IconSend size={18} /></ActionIcon></Group>
+        <Textarea value={prompt} onChange={(event) => setPrompt(event.currentTarget.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); submitPrompt(); } }} placeholder="Pregunta, crea o explora una idea..." aria-label="Mensaje" autosize minRows={1} maxRows={4} variant="unstyled" disabled={chatBusy} />
+        <Group justify="space-between" mt="xs"><ActionIcon variant="subtle" color="gray" aria-label="Adjuntar archivo" onClick={attachDocument} loading={attachmentBusy}><IconPlus size={19} /></ActionIcon><ActionIcon size="lg" radius="md" color="violet" aria-label="Enviar mensaje" onClick={submitPrompt} loading={chatBusy} disabled={!prompt.trim()}><IconSend size={18} /></ActionIcon></Group>
       </Paper>
       {attachmentError && <Text ta="center" size="xs" c="red.4" mt={7}>{attachmentError}</Text>}
+      {chatError && <Text ta="center" size="xs" c="red.4" mt={7}>{chatError}</Text>}
       <Text ta="center" size="xs" c="dimmed" mt={9}>MEMORIÓN puede cometer errores. Verifica la información importante.</Text>
     </div>
   );

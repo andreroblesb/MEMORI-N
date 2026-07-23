@@ -24,6 +24,109 @@ fn required_text(value: &str, field: &str) -> CrudResult<String> {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMessage {
+    pub id: i64,
+    pub scope: String,
+    pub folder_id: Option<i64>,
+    pub role: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+fn session_message_from_row(row: &Row<'_>) -> rusqlite::Result<SessionMessage> {
+    Ok(SessionMessage {
+        id: row.get(0)?,
+        scope: row.get(1)?,
+        folder_id: row.get(2)?,
+        role: row.get(3)?,
+        content: row.get(4)?,
+        created_at: row.get(5)?,
+    })
+}
+
+#[tauri::command]
+pub fn list_session_messages(
+    folder_id: Option<i64>,
+    database: State<'_, Database>,
+) -> CrudResult<Vec<SessionMessage>> {
+    let scope = if folder_id.is_some() {
+        "folder"
+    } else {
+        "general"
+    };
+    let connection = database.connection()?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id,scope,folder_id,role,content,created_at
+             FROM session_message
+             WHERE scope=?1 AND folder_id IS ?2
+             ORDER BY id",
+        )
+        .map_err(|error| db_error("No fue posible preparar el historial de sesión", error))?;
+    let result = statement
+        .query_map(params![scope, folder_id], session_message_from_row)
+        .map_err(|error| db_error("No fue posible consultar el historial de sesión", error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| db_error("No fue posible leer el historial de sesión", error));
+    result
+}
+
+#[tauri::command]
+pub fn append_session_message(
+    folder_id: Option<i64>,
+    role: String,
+    content: String,
+    database: State<'_, Database>,
+) -> CrudResult<SessionMessage> {
+    let role = required_text(&role, "role")?;
+    if role != "user" && role != "assistant" {
+        return Err("role debe ser user o assistant".into());
+    }
+    let content = required_text(&content, "content")?;
+    let scope = if folder_id.is_some() {
+        "folder"
+    } else {
+        "general"
+    };
+    let connection = database.connection()?;
+    connection
+        .execute(
+            "INSERT INTO session_message(scope,folder_id,role,content)
+             VALUES(?1,?2,?3,?4)",
+            params![scope, folder_id, role, content],
+        )
+        .map_err(|error| db_error("No fue posible guardar el mensaje de sesión", error))?;
+    connection
+        .query_row(
+            "SELECT id,scope,folder_id,role,content,created_at
+             FROM session_message WHERE id=?1",
+            [connection.last_insert_rowid()],
+            session_message_from_row,
+        )
+        .map_err(|error| db_error("No fue posible recuperar el mensaje de sesión", error))
+}
+
+#[tauri::command]
+pub fn clear_session_messages(
+    folder_id: Option<i64>,
+    database: State<'_, Database>,
+) -> CrudResult<usize> {
+    let scope = if folder_id.is_some() {
+        "folder"
+    } else {
+        "general"
+    };
+    database
+        .connection()?
+        .execute(
+            "DELETE FROM session_message WHERE scope=?1 AND folder_id IS ?2",
+            params![scope, folder_id],
+        )
+        .map_err(|error| db_error("No fue posible limpiar el historial de sesión", error))
+}
+
 fn validate_scope(scope: &str, folder_id: Option<i64>) -> CrudResult<()> {
     match (scope, folder_id) {
         ("general", None) | ("folder", Some(_)) => Ok(()),

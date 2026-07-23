@@ -247,7 +247,8 @@ pub fn run() {
             database::upsert_knowledge_vector,
             database::get_knowledge_vector,
             database::delete_knowledge_vector,
-            database::search_knowledge
+            database::search_knowledge,
+            database::store_general_chat_knowledge
         ])
         .run(tauri::generate_context!())
         .expect("error while running MEMORIÓN");

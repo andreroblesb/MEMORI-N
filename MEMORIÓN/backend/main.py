@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import asynccontextmanager, suppress
+from threading import Lock
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,6 +13,13 @@ from .services.ai.chat_service import ChatRequest, ChatResponse, ChatService
 from .services.ai.events import ModelEvent, ModelEventBus
 from .services.ai.loader import ModelLoader
 from .services.ai.logging_config import configure_model_logging
+from .services.ai.memory_service import (
+    EmbeddingRequest,
+    EmbeddingResponse,
+    KnowledgeExtractionRequest,
+    KnowledgeExtractionResponse,
+    MemoryAiService,
+)
 from .services.ai.model_manager import ModelManager
 
 
@@ -20,11 +28,14 @@ event_bus = ModelEventBus(logger=model_logger)
 model_manager = ModelManager.from_defaults(event_callback=event_bus.publish)
 model_loader = ModelLoader()
 chat_service: ChatService | None = None
+memory_ai_service: MemoryAiService | None = None
+chat_model_lock = Lock()
+embedding_model_lock = Lock()
 initialization_task: asyncio.Task[None] | None = None
 
 
 async def initialize_models() -> None:
-    global chat_service
+    global chat_service, memory_ai_service
     event_bus.publish(ModelEvent(status="PENDING", message="Preparando modelos"))
     model_logger.info("Manifest: %s", model_manager.manifest_path)
     model_logger.info("Carpeta de modelos: %s", model_manager.models_directory)
@@ -32,7 +43,13 @@ async def initialize_models() -> None:
         paths = await model_manager.ensure_models()
         event_bus.publish_loading()
         await asyncio.to_thread(model_loader.load, paths)
-        chat_service = ChatService(model_loader.models.chat)
+        chat_service = ChatService(model_loader.models.chat, chat_model_lock)
+        memory_ai_service = MemoryAiService(
+            model_loader.models.chat,
+            model_loader.models.embedding,
+            chat_model_lock,
+            embedding_model_lock,
+        )
         event_bus.publish_ready(paths)
     except asyncio.CancelledError:
         raise
@@ -127,4 +144,28 @@ async def chat(request: ChatRequest) -> ChatResponse:
         return await asyncio.to_thread(chat_service.complete, request)
     except Exception as exc:
         model_logger.exception("La inferencia conversacional falló")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/embeddings", response_model=EmbeddingResponse)
+async def embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
+    if memory_ai_service is None:
+        raise HTTPException(status_code=503, detail="Los modelos todavía se están preparando.")
+    try:
+        return await asyncio.to_thread(memory_ai_service.embed, request)
+    except Exception as exc:
+        model_logger.exception("La generación de embedding falló")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/knowledge/extract", response_model=KnowledgeExtractionResponse)
+async def extract_knowledge(
+    request: KnowledgeExtractionRequest,
+) -> KnowledgeExtractionResponse:
+    if memory_ai_service is None:
+        raise HTTPException(status_code=503, detail="Los modelos todavía se están preparando.")
+    try:
+        return await asyncio.to_thread(memory_ai_service.extract, request)
+    except Exception as exc:
+        model_logger.exception("La extracción de conocimiento falló")
         raise HTTPException(status_code=500, detail=str(exc)) from exc

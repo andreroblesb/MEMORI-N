@@ -40,7 +40,7 @@ import {
 } from "@tabler/icons-react";
 import "./App.css";
 import { MarkdownMessage } from "./components/MarkdownMessage";
-import { completeChat } from "./services/chatApi";
+import { completeChat, createEmbedding, extractKnowledge } from "./services/chatApi";
 
 type View = "chat" | "analytics";
 type Folder = {
@@ -63,8 +63,27 @@ type DocumentRecord = {
   indexingStatus: string;
 };
 type SystemMetrics = { cpuPercent: number; ramUsedBytes: number; ramTotalBytes: number };
+type KnowledgeMatch = { knowledge: { content: string }; distance: number };
 
 const inTauri = () => "__TAURI_INTERNALS__" in window;
+
+function recentKnowledgeContext(messages: Message[]): Message[] {
+  const selected: Message[] = [];
+  let users = 0;
+  let assistants = 0;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role === "user" && users < 2) {
+      selected.push(message);
+      users += 1;
+    } else if (message.role === "assistant" && assistants < 2) {
+      selected.push(message);
+      assistants += 1;
+    }
+    if (users === 2 && assistants === 2) break;
+  }
+  return selected.reverse();
+}
 
 function App() {
   const [view, setView] = useState<View>("chat");
@@ -144,7 +163,20 @@ function App() {
           content: clean,
         });
       }
-      const content = await completeChat(nextMessages);
+      let memories: string[] = [];
+      if (inTauri() && targetFolder === null) {
+        const queryEmbedding = await createEmbedding(clean);
+        const matches = await invoke<KnowledgeMatch[]>("search_knowledge", {
+          embedding: queryEmbedding,
+          scope: "general",
+          folderId: null,
+          limit: 5,
+        });
+        memories = matches
+          .filter((match) => match.distance <= 0.55)
+          .map((match) => match.knowledge.content);
+      }
+      const content = await completeChat(nextMessages.slice(-20), memories);
       if (inTauri()) {
         await invoke("append_session_message", {
           folderId: targetFolder,
@@ -154,6 +186,25 @@ function App() {
       }
       if (selectedFolderRef.current === targetFolder) {
         setMessages((current) => [...current, { role: "assistant", content }]);
+      }
+      if (inTauri() && targetFolder === null) {
+        const contextMessages = recentKnowledgeContext(messages);
+        void (async () => {
+          const extraction = await extractKnowledge([
+            ...contextMessages,
+            { role: "user", content: clean },
+          ]);
+          if (!extraction.should_store || !extraction.content) return;
+          const embedding = await createEmbedding(extraction.content);
+          await invoke("store_general_chat_knowledge", {
+            input: {
+              userInput: clean,
+              content: extraction.content,
+              contextMessages,
+              embedding,
+            },
+          });
+        })().catch((error) => console.error("No se pudo crear knowledge item", error));
       }
     } catch (error) {
       setChatError(error instanceof Error ? error.message : String(error));

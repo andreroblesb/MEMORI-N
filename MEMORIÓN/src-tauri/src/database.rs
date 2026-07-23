@@ -11,7 +11,8 @@ const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_initial.sql");
 const VECTOR_INTEGRITY_MIGRATION: &str = include_str!("../migrations/0002_vector_integrity.sql");
 const DOCUMENT_SOURCES_MIGRATION: &str = include_str!("../migrations/0003_document_sources.sql");
 const SESSION_MESSAGES_MIGRATION: &str = include_str!("../migrations/0004_session_messages.sql");
-pub const EMBEDDING_DIMENSIONS: u32 = 768;
+const EMBEDDING_1024_MIGRATION: &str = include_str!("../migrations/0005_embedding_1024.sql");
+pub const EMBEDDING_DIMENSIONS: u32 = 1024;
 
 static REGISTER_SQLITE_VEC: Once = Once::new();
 
@@ -151,7 +152,7 @@ fn migrate(connection: &Connection) -> Result<(), String> {
         2 => connection
             .execute_batch(DOCUMENT_SOURCES_MIGRATION)
             .map_err(|error| format!("Falló la migración de fuentes documentales: {error}")),
-        3 | 4 => Ok(()),
+        3 | 4 | 5 => Ok(()),
         other => Err(format!(
             "La base de datos usa una versión de esquema no compatible: {other}"
         )),
@@ -160,10 +161,14 @@ fn migrate(connection: &Connection) -> Result<(), String> {
     if version < 4 {
         connection
             .execute_batch(SESSION_MESSAGES_MIGRATION)
-            .map_err(|error| format!("Falló la migración del historial de sesión: {error}"))
-    } else {
-        Ok(())
+            .map_err(|error| format!("Falló la migración del historial de sesión: {error}"))?;
     }
+    if version < 5 {
+        connection
+            .execute_batch(EMBEDDING_1024_MIGRATION)
+            .map_err(|error| format!("Falló la migración de vectores a 1024: {error}"))?;
+    }
+    Ok(())
 }
 
 fn verify_database(connection: &Connection) -> Result<(), String> {
@@ -208,8 +213,8 @@ mod tests {
     fn initial_schema_and_vec_extension_are_available() {
         let (database, path) = temporary_database("schema-test");
         let status = database.status().expect("status should be readable");
-        assert_eq!(status.schema_version, 4);
-        assert_eq!(status.embedding_dimensions, 768);
+        assert_eq!(status.schema_version, 5);
+        assert_eq!(status.embedding_dimensions, 1024);
 
         drop(database);
         remove_database_files(path);

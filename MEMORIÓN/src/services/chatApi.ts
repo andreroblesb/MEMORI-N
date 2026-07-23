@@ -3,44 +3,60 @@ export type ChatMessage = {
   content: string;
 };
 
-type ChatResponse = {
-  content: string;
-};
+type ChatResponse = { content: string };
+type EmbeddingResponse = { embedding: number[]; dimensions: number };
+export type KnowledgeExtraction = { should_store: boolean; content: string | null };
 
 const BACKEND_URL = "http://127.0.0.1:8000";
 
-export async function completeChat(messages: ChatMessage[]): Promise<string> {
+async function postJson<T>(path: string, body: object): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(`${BACKEND_URL}/api/chat`, {
+    response = await fetch(`${BACKEND_URL}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messages }),
+      body: JSON.stringify(body),
     });
   } catch {
     throw new Error(
       "No fue posible conectar con FastAPI. Verifica que esté ejecutándose en 127.0.0.1:8000.",
     );
   }
-
   if (!response.ok) {
     let detail = `El backend respondió con el estado ${response.status}.`;
     try {
-      const body = (await response.json()) as { detail?: string };
-      if (body.detail) detail = body.detail;
+      const payload = (await response.json()) as { detail?: string };
+      if (payload.detail) detail = payload.detail;
     } catch {
-      // Preserve the HTTP status fallback when the body is not JSON.
+      // Preserve the HTTP fallback.
     }
     if (response.status === 404) {
-      detail =
-        "El FastAPI en el puerto 8000 es una versión anterior y no contiene /api/chat. Reinícialo.";
+      detail = `El FastAPI activo no contiene ${path}. Reinícialo.`;
     }
     throw new Error(detail);
   }
+  return (await response.json()) as T;
+}
 
-  const body = (await response.json()) as ChatResponse;
-  if (!body.content?.trim()) {
+export async function completeChat(
+  messages: ChatMessage[],
+  memories: string[] = [],
+): Promise<string> {
+  const response = await postJson<ChatResponse>("/api/chat", { messages, memories });
+  if (!response.content?.trim()) {
     throw new Error("El modelo devolvió una respuesta vacía.");
   }
-  return body.content.trim();
+  return response.content.trim();
+}
+
+export async function createEmbedding(text: string): Promise<number[]> {
+  const response = await postJson<EmbeddingResponse>("/api/embeddings", { text });
+  if (response.dimensions !== response.embedding.length) {
+    throw new Error("El backend devolvió un embedding inconsistente.");
+  }
+  return response.embedding;
+}
+
+export function extractKnowledge(messages: ChatMessage[]): Promise<KnowledgeExtraction> {
+  return postJson<KnowledgeExtraction>("/api/knowledge/extract", { messages });
 }

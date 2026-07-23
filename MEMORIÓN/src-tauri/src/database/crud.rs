@@ -1244,6 +1244,149 @@ pub struct KnowledgeVector {
     pub folder_id: Option<i64>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub struct KnowledgeContextMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoreChatKnowledge {
+    pub user_input: String,
+    pub content: String,
+    pub context_messages: Vec<KnowledgeContextMessage>,
+    pub embedding: Vec<f32>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredChatKnowledge {
+    pub knowledge_id: i64,
+    pub created: bool,
+}
+
+#[tauri::command]
+pub fn store_general_chat_knowledge(
+    input: StoreChatKnowledge,
+    database: State<'_, Database>,
+) -> CrudResult<StoredChatKnowledge> {
+    let user_input = required_text(&input.user_input, "userInput")?;
+    let content = required_text(&input.content, "content")?;
+    if input.context_messages.len() > 4 {
+        return Err("contextMessages admite como máximo cuatro mensajes".into());
+    }
+    for message in &input.context_messages {
+        if message.role != "user" && message.role != "assistant" {
+            return Err("El contexto contiene un role inválido".into());
+        }
+        required_text(&message.content, "contextMessages.content")?;
+    }
+    let embedding_json = vector_json(&input.embedding)?;
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    let content_hash = format!("{:x}", hasher.finalize());
+    let mut connection = database.connection()?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| db_error("No fue posible iniciar la memoria", error))?;
+
+    let existing: Option<i64> = transaction
+        .query_row(
+            "SELECT id FROM knowledge_item
+             WHERE scope='general' AND content_hash=?1 LIMIT 1",
+            [&content_hash],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| db_error("No fue posible buscar conocimiento duplicado", error))?;
+    if let Some(knowledge_id) = existing {
+        return Ok(StoredChatKnowledge {
+            knowledge_id,
+            created: false,
+        });
+    }
+
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO ai_model(provider,model_key,display_name,version,endpoint,enabled)
+             VALUES('local','chat','Modelo conversacional local','1','',1)",
+            [],
+        )
+        .map_err(|error| db_error("No fue posible registrar el modelo conversacional", error))?;
+    let chat_model_id: i64 = transaction
+        .query_row(
+            "SELECT id FROM ai_model WHERE provider='local' AND model_key='chat' AND endpoint=''",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| db_error("No fue posible consultar el modelo conversacional", error))?;
+
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO ai_model(provider,model_key,display_name,version,endpoint,enabled)
+             VALUES('local','embedding','Modelo de embeddings local','1','',1)",
+            [],
+        )
+        .map_err(|error| db_error("No fue posible registrar el modelo de embeddings", error))?;
+    let embedding_model_id: i64 = transaction
+        .query_row(
+            "SELECT id FROM ai_model WHERE provider='local' AND model_key='embedding' AND endpoint=''",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| db_error("No fue posible consultar el modelo de embeddings", error))?;
+    transaction
+        .execute(
+            "INSERT INTO model_capability(model_id,capability,embedding_dimensions,distance_metric)
+             VALUES(?1,'embedding',?2,'cosine')
+             ON CONFLICT(model_id,capability) DO UPDATE SET
+             embedding_dimensions=excluded.embedding_dimensions,
+             distance_metric=excluded.distance_metric",
+            params![embedding_model_id, EMBEDDING_DIMENSIONS],
+        )
+        .map_err(|error| db_error("No fue posible registrar la capacidad embedding", error))?;
+
+    transaction
+        .execute(
+            "INSERT INTO knowledge_origin(scope,folder_id,user_input)
+             VALUES('general',NULL,?1)",
+            [&user_input],
+        )
+        .map_err(|error| db_error("No fue posible guardar el origen del conocimiento", error))?;
+    let origin_id = transaction.last_insert_rowid();
+    let metadata = serde_json::json!({
+        "context_messages": input.context_messages,
+        "capture": "automatic_chat_statement"
+    })
+    .to_string();
+    transaction
+        .execute(
+            "INSERT INTO knowledge_item(
+                origin_id,generator_model_id,scope,source_type,content,content_hash,
+                is_confirmed,location_metadata
+             ) VALUES(?1,?2,'general','chat_statement',?3,?4,1,?5)",
+            params![origin_id, chat_model_id, content, content_hash, metadata],
+        )
+        .map_err(|error| db_error("No fue posible guardar el conocimiento", error))?;
+    let knowledge_id = transaction.last_insert_rowid();
+    transaction
+        .execute(
+            "INSERT INTO knowledge_vector(
+                knowledge_id,embedding,embedding_model_id,scope,folder_id
+             ) VALUES(?1,vec_f32(?2),?3,'general',0)",
+            params![knowledge_id, embedding_json, embedding_model_id],
+        )
+        .map_err(|error| db_error("No fue posible guardar el vector del conocimiento", error))?;
+    transaction
+        .commit()
+        .map_err(|error| db_error("No fue posible confirmar la memoria", error))?;
+    Ok(StoredChatKnowledge {
+        knowledge_id,
+        created: true,
+    })
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KnowledgeMatch {

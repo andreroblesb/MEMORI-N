@@ -1,0 +1,15 @@
+{
+  "version": "1.0.0",
+  "models": {
+    "embedding": {
+      "filename": "embedding.gguf",
+      "url": "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf",
+      "sha256": "06507C7B42688469C4E7298B0A1E16DEFF06CAF291CF0A5B278C308249C3E439" // not really used
+    },
+    "chat": {
+      "filename": "chat.gguf",
+      "url": "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q8_0.gguf",
+      "sha256": "10CC391B403021DD11C614679D2FD92F611C3681D29E29651B717316965D61E1" // not really used
+    }
+  }
+}

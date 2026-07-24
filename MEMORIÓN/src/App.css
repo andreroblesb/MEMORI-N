@@ -24,6 +24,9 @@ button { font: inherit; }
 .folder-card, .metric-card, .chart-card { border: 1px solid #292b35; background: rgba(20, 21, 28, .78); }
 .composer-wrap { position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%); width: min(760px, calc(100% - 48px)); z-index: 5; }
 .composer { padding: 13px 13px 10px 16px; border: 1px solid #363844; border-radius: 16px; background: rgba(24, 25, 33, .96); box-shadow: 0 18px 60px rgba(0,0,0,.4); }
+.memory-notice { margin-bottom: 9px; padding: 10px 11px; border: 1px solid rgba(45,212,191,.28); background: rgba(18,31,31,.97); }
+.memory-notice > .mantine-Group-root > .mantine-Group-root { min-width: 0; }
+.memory-notice > .mantine-Group-root > .mantine-Group-root > div:last-child { min-width: 0; }
 .composer textarea { color: #f1f1f5; font-size: 15px; }
 .attachment-list { max-height: 74px; overflow-y: auto; }.attachment-chip { max-width: 210px; min-width: 0; display: flex; align-items: center; gap: 6px; padding: 5px 6px 5px 8px; border: 1px solid #333541; background: #1c1d25; }.attachment-chip .mantine-Text-root { min-width: 0; }
 .messages-area { height: calc(100vh - 60px); padding: 12px 28px 180px; }
@@ -58,6 +61,10 @@ button { font: inherit; }
 .metric-card { min-height: 118px; padding: 16px; }.chart-card { min-height: 0; padding: 20px; }
 .analytics-charts { min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, .85fr); gap: 16px; }
 .activity-chart { display: flex; flex-direction: column; }
+.mapped-storage { flex: 1; padding-top: 14px; }
+.storage-detail { padding: 12px 14px; border: 1px solid #30323b; background: #181920; }
+.metric-info { flex: 0 0 auto; color: #777986; cursor: help; transition: color .15s ease; }
+.metric-info:hover { color: #a78bfa; }
 .bar-chart { min-height: 120px; flex: 1; display: flex; align-items: flex-end; gap: 9px; padding: 20px 4px 8px; }
 .bar-track { flex: 1; height: 100%; display: flex; align-items: flex-end; border-radius: 5px; background: #1c1d25; overflow: hidden; }.bar { width: 100%; min-height: 5px; background: linear-gradient(#9b7aea, #6545bb); border-radius: 5px 5px 2px 2px; }
 .resource-stack { min-height: 0; display: grid; grid-template-rows: 1fr 1fr; gap: 16px; }.resource-card { min-height: 0; padding: 15px 18px; border: 1px solid #292b35; background: rgba(20, 21, 28, .78); display: flex; flex-direction: column; }.resource-line { flex: 1; min-height: 38px; margin: 6px 0 3px; border-bottom: 1px solid #282a33; background: linear-gradient(180deg, rgba(124,58,237,.04), transparent); }.resource-line svg { width: 100%; height: 100%; overflow: visible; }

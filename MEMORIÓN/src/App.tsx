@@ -29,6 +29,7 @@ import {
   IconEdit,
   IconFileText,
   IconFolder,
+  IconInfoCircle,
   IconMessage,
   IconPlus,
   IconSearch,
@@ -63,6 +64,14 @@ type DocumentRecord = {
   indexingStatus: string;
 };
 type SystemMetrics = { cpuPercent: number; ramUsedBytes: number; ramTotalBytes: number };
+type ActivityMetrics = {
+  folderChatCount: number;
+  sessionMessageCount: number;
+  sessionTextBytes: number;
+  mappedFileCount: number;
+  mappedFolderBytes: number;
+  inaccessibleEntryCount: number;
+};
 type KnowledgeMatch = { knowledge: { content: string }; distance: number };
 
 const inTauri = () => "__TAURI_INTERNALS__" in window;
@@ -389,7 +398,7 @@ function App() {
           </section>
         )}
 
-        {view === "analytics" && <Analytics folderCount={folders.length} />}
+        {view === "analytics" && <Analytics />}
       </main>
 
       <Modal opened={folderModal} onClose={() => setFolderModal(false)} title="Editar carpetas" centered overlayProps={{ backgroundOpacity: 0.65, blur: 5 }}>
@@ -433,7 +442,7 @@ function Composer({ prompt, setPrompt, submitPrompt, documents, attachDocument, 
             <ActionIcon variant="transparent" color="gray" size="xs" aria-label={`Quitar ${document.relativePath}`} onClick={() => removeDocument(document.id)}><IconX size={12} /></ActionIcon>
           </Paper>)}
         </Group>}
-        <Textarea value={prompt} onChange={(event) => setPrompt(event.currentTarget.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); submitPrompt(); } }} placeholder="Pregunta, crea o explora una idea..." aria-label="Mensaje" autosize minRows={1} maxRows={4} variant="unstyled" disabled={chatBusy} />
+        <Textarea value={prompt} onChange={(event) => setPrompt(event.currentTarget.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); submitPrompt(); } }} placeholder="Pregunta o pide recordar algo..." aria-label="Mensaje" autosize minRows={1} maxRows={4} variant="unstyled" disabled={chatBusy} />
         <Group justify="space-between" mt="xs"><ActionIcon variant="subtle" color="gray" aria-label="Adjuntar archivo" onClick={attachDocument} loading={attachmentBusy}><IconPlus size={19} /></ActionIcon><ActionIcon size="lg" radius="md" color="violet" aria-label="Enviar mensaje" onClick={submitPrompt} loading={chatBusy} disabled={!prompt.trim()}><IconSend size={18} /></ActionIcon></Group>
       </Paper>
       {attachmentError && <Text ta="center" size="xs" c="red.4" mt={7}>{attachmentError}</Text>}
@@ -443,13 +452,29 @@ function Composer({ prompt, setPrompt, submitPrompt, documents, attachDocument, 
   );
 }
 
-function Analytics({ folderCount }: { folderCount: number }) {
-  const bars = [32, 46, 38, 72, 55, 84, 68, 94, 64, 78, 58, 86];
-  const [cpu, setCpu] = useState([26, 34, 31, 48, 43, 62, 39, 52, 45, 58, 41, 47]);
-  const [ram, setRam] = useState([52, 54, 53, 58, 61, 60, 64, 67, 66, 69, 68, 71]);
-  const [metrics, setMetrics] = useState<SystemMetrics>({ cpuPercent: 47, ramUsedBytes: 5.7 * 1024 ** 3, ramTotalBytes: 8 * 1024 ** 3 });
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  let unit = units[0];
+  for (let index = 1; value >= 1024 && index < units.length; index += 1) {
+    value /= 1024;
+    unit = units[index];
+  }
+  return `${value.toFixed(value >= 10 ? 1 : 2)} ${unit}`;
+}
+
+function Analytics() {
+  const [cpu, setCpu] = useState<number[]>(Array(12).fill(0));
+  const [ram, setRam] = useState<number[]>(Array(12).fill(0));
+  const [metrics, setMetrics] = useState<SystemMetrics>({ cpuPercent: 0, ramUsedBytes: 0, ramTotalBytes: 0 });
+  const [activity, setActivity] = useState<ActivityMetrics | null>(null);
+  const [activityError, setActivityError] = useState("");
   useEffect(() => {
     if (!inTauri()) return;
+    invoke<ActivityMetrics>("get_activity_metrics")
+      .then(setActivity)
+      .catch((error) => setActivityError(String(error)));
     const updateMetrics = async () => {
       try {
         const next = await invoke<SystemMetrics>("get_system_metrics");
@@ -465,14 +490,46 @@ function Analytics({ folderCount }: { folderCount: number }) {
   }, []);
   const usedRamGb = metrics.ramUsedBytes / 1024 ** 3;
   const totalRamGb = metrics.ramTotalBytes / 1024 ** 3;
+  const cards = [
+    { label: "Chats de carpeta", value: activity ? String(activity.folderChatCount) : "—", delta: "Registrados", icon: IconMessage },
+    { label: "Mensajes en esta sesión", value: activity ? String(activity.sessionMessageCount) : "—", delta: "Temporal", icon: IconActivity },
+    { label: "Peso del texto de la sesión", value: activity ? formatBytes(activity.sessionTextBytes) : "—", delta: "UTF-8", icon: IconFileText },
+  ];
   return (
     <section className="analytics-view"><div className="analytics-container">
-      <div className="analytics-heading"><Text size="sm" c="violet.3" fw={650}>Resumen de los últimos 30 días</Text><Title order={2} mt={2}>Tu actividad</Title><Text c="dimmed" size="sm" mt={3}>Actividad y recursos del equipo en una sola vista.</Text></div>
+      <div className="analytics-heading"><Text size="sm" c="violet.3" fw={650}>Estado de la sesión actual</Text><Title order={2} mt={2}>Tu actividad</Title><Text c="dimmed" size="sm" mt={3}>Datos locales medidos directamente por MEMORIÓN.</Text></div>
       <SimpleGrid cols={3} spacing="md" className="metrics-grid">
-        {[{ label: "Conversaciones", value: "48", delta: "+12%", icon: IconMessage }, { label: "Mensajes", value: "326", delta: "+8%", icon: IconActivity }, { label: "Carpetas registradas", value: String(folderCount), delta: "Local", icon: IconFolder }].map((metric) => <Card key={metric.label} className="metric-card"><Group justify="space-between"><ThemeIcon variant="light" color="violet" size={34}><metric.icon size={18} /></ThemeIcon><Badge variant="light" color="teal">{metric.delta}</Badge></Group><Text size="xl" fw={750} mt="sm">{metric.value}</Text><Text size="sm" c="dimmed">{metric.label}</Text></Card>)}
+        {cards.map((metric) => <Card key={metric.label} className="metric-card"><Group justify="space-between"><ThemeIcon variant="light" color="violet" size={34}><metric.icon size={18} /></ThemeIcon><Badge variant="light" color="teal">{metric.delta}</Badge></Group><Text size="xl" fw={750} mt="sm">{metric.value}</Text><Text size="sm" c="dimmed">{metric.label}</Text></Card>)}
       </SimpleGrid>
       <div className="analytics-charts">
-        <Card className="chart-card activity-chart"><Group justify="space-between"><div><Text fw={700}>Mensajes por día</Text><Text size="sm" c="dimmed">Actividad reciente</Text></div><Badge variant="outline" color="gray">12 días</Badge></Group><div className="bar-chart">{bars.map((height, index) => <div key={index} className="bar-track"><div className="bar" style={{ height: `${height}%` }} /></div>)}</div><Group justify="space-between"><Text size="xs" c="dimmed">8 jul</Text><Text size="xs" c="dimmed">Hoy</Text></Group></Card>
+        <Card className="chart-card activity-chart">
+          <Group justify="space-between"><div><Text fw={700}>Contenido de carpetas mapeadas</Text><Text size="sm" c="dimmed">Suma real de los archivos accesibles</Text></div><ThemeIcon variant="light" color="violet" size={36}><IconFolder size={19} /></ThemeIcon></Group>
+          <Stack justify="center" gap="lg" className="mapped-storage">
+            <div><Text fz={34} fw={760}>{activity ? formatBytes(activity.mappedFolderBytes) : "—"}</Text><Text size="sm" c="dimmed">Tamaño total en disco</Text></div>
+            <Group grow>
+              <Paper className="storage-detail">
+                <Text fw={700}>{activity?.mappedFileCount ?? "—"}</Text>
+                <Group gap={4} wrap="nowrap">
+                  <Text size="xs" c="dimmed">Archivos encontrados</Text>
+                  <Tooltip label="Todos los archivos descubiertos recursivamente dentro de las carpetas registradas." multiline w={240}>
+                    <IconInfoCircle className="metric-info" size={14} />
+                  </Tooltip>
+                </Group>
+              </Paper>
+              <Paper className="storage-detail">
+                <Text fw={700}>{activity?.folderChatCount ?? "—"}</Text>
+                <Group gap={4} wrap="nowrap">
+                  <Text size="xs" c="dimmed">Carpetas raíz</Text>
+                  <Tooltip label="Carpetas que registraste directamente como chats. No incluye sus subcarpetas." multiline w={240}>
+                    <IconInfoCircle className="metric-info" size={14} />
+                  </Tooltip>
+                </Group>
+              </Paper>
+            </Group>
+            {activity && activity.inaccessibleEntryCount > 0 && <Text size="xs" c="yellow.5">{activity.inaccessibleEntryCount} rutas no pudieron leerse.</Text>}
+            {activityError && <Text size="xs" c="red.4">{activityError}</Text>}
+          </Stack>
+        </Card>
         <div className="resource-stack"><ResourceCard title="Consumo de CPU" value={`${metrics.cpuPercent.toFixed(0)}%`} data={cpu} color="#8b5cf6" /><ResourceCard title="Consumo de RAM" value={`${usedRamGb.toFixed(1)} GB`} subtitle={`de ${totalRamGb.toFixed(1)} GB`} data={ram} color="#2dd4bf" /></div>
       </div>
     </div></section>

@@ -127,6 +127,104 @@ pub fn clear_session_messages(
         .map_err(|error| db_error("No fue posible limpiar el historial de sesión", error))
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityMetrics {
+    pub folder_chat_count: i64,
+    pub session_message_count: i64,
+    pub session_text_bytes: i64,
+    pub mapped_file_count: u64,
+    pub mapped_folder_bytes: u64,
+    pub inaccessible_entry_count: u64,
+}
+
+fn measure_folder_tree(paths: Vec<PathBuf>) -> (u64, u64, u64) {
+    let mut stack = paths;
+    let mut file_count = 0_u64;
+    let mut total_bytes = 0_u64;
+    let mut inaccessible = 0_u64;
+    while let Some(path) = stack.pop() {
+        let entries = match std::fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(_) => {
+                inaccessible += 1;
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    inaccessible += 1;
+                    continue;
+                }
+            };
+            let metadata = match entry.path().symlink_metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    inaccessible += 1;
+                    continue;
+                }
+            };
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                stack.push(entry.path());
+            } else if metadata.is_file() {
+                file_count += 1;
+                total_bytes = total_bytes.saturating_add(metadata.len());
+            }
+        }
+    }
+    (file_count, total_bytes, inaccessible)
+}
+
+#[tauri::command]
+pub async fn get_activity_metrics(database: State<'_, Database>) -> CrudResult<ActivityMetrics> {
+    let (folder_chat_count, session_message_count, session_text_bytes, paths) = {
+        let connection = database.connection()?;
+        let folder_chat_count = connection
+            .query_row("SELECT count(*) FROM folder", [], |row| row.get(0))
+            .map_err(|error| db_error("No fue posible contar los chats", error))?;
+        let (session_message_count, session_text_bytes) = connection
+            .query_row(
+                "SELECT count(*),coalesce(sum(length(CAST(content AS BLOB))),0)
+                 FROM session_message",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| db_error("No fue posible medir la sesión", error))?;
+        let mut statement = connection
+            .prepare("SELECT canonical_path FROM folder")
+            .map_err(|error| db_error("No fue posible consultar carpetas mapeadas", error))?;
+        let paths = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| db_error("No fue posible recorrer carpetas mapeadas", error))?
+            .filter_map(Result::ok)
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        (
+            folder_chat_count,
+            session_message_count,
+            session_text_bytes,
+            paths,
+        )
+    };
+    let (mapped_file_count, mapped_folder_bytes, inaccessible_entry_count) =
+        tauri::async_runtime::spawn_blocking(move || measure_folder_tree(paths))
+            .await
+            .map_err(|error| format!("No fue posible medir las carpetas: {error}"))?;
+    Ok(ActivityMetrics {
+        folder_chat_count,
+        session_message_count,
+        session_text_bytes,
+        mapped_file_count,
+        mapped_folder_bytes,
+        inaccessible_entry_count,
+    })
+}
+
 fn validate_scope(scope: &str, folder_id: Option<i64>) -> CrudResult<()> {
     match (scope, folder_id) {
         ("general", None) | ("folder", Some(_)) => Ok(()),

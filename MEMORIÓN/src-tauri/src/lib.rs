@@ -196,6 +196,10 @@ pub fn run() {
             let database = Database::open(app.handle())
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
             app.manage(database);
+            #[cfg(debug_assertions)]
+            if let Some(window) = app.get_webview_window("main") {
+                window.open_devtools();
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -209,6 +213,7 @@ pub fn run() {
             database::list_session_messages,
             database::append_session_message,
             database::clear_session_messages,
+            database::get_activity_metrics,
             database::create_folder,
             database::get_folder,
             database::list_folders,

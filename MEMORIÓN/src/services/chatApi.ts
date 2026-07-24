@@ -9,19 +9,33 @@ export type KnowledgeExtraction = { should_store: boolean; content: string | nul
 export type DocumentChunk = { content: string; chunk_index: number; token_count: number };
 
 const BACKEND_URL = "http://127.0.0.1:8000";
+const pendingRequests = new Set<AbortController>();
+
+export function cancelPendingRequests(): void {
+  for (const controller of pendingRequests) controller.abort();
+  pendingRequests.clear();
+}
 
 async function postJson<T>(path: string, body: object): Promise<T> {
   let response: Response;
+  const controller = new AbortController();
+  pendingRequests.add(controller);
   try {
     response = await fetch(`${BACKEND_URL}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal: controller.signal,
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error("La operación fue cancelada.");
+    }
     throw new Error(
       "No fue posible conectar con FastAPI. Verifica que esté ejecutándose en 127.0.0.1:8000.",
     );
+  } finally {
+    pendingRequests.delete(controller);
   }
   if (!response.ok) {
     let detail = `El backend respondió con el estado ${response.status}.`;

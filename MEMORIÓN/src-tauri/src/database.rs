@@ -14,6 +14,9 @@ const SESSION_MESSAGES_MIGRATION: &str = include_str!("../migrations/0004_sessio
 const EMBEDDING_1024_MIGRATION: &str = include_str!("../migrations/0005_embedding_1024.sql");
 const FOLDER_INDEXING_MIGRATION: &str = include_str!("../migrations/0006_folder_indexing.sql");
 const FIXED_DOCUMENT_FORMATS_MIGRATION: &str = include_str!("../migrations/0007_fixed_document_formats.sql");
+const FOLDER_FORMAT_SELECTION_MIGRATION: &str = include_str!("../migrations/0008_folder_format_selection.sql");
+#[cfg(test)]
+const NUKE_CHAT_DATA: &str = include_str!("../maintenance/nuke_chat_data.sql");
 pub const EMBEDDING_DIMENSIONS: u32 = 1024;
 
 static REGISTER_SQLITE_VEC: Once = Once::new();
@@ -26,6 +29,7 @@ pub struct Database {
 impl Drop for Database {
     fn drop(&mut self) {
         if let Ok(connection) = self.connection.get_mut() {
+            let _ = cleanup_interrupted_indexing(connection);
             let _ = connection.execute("DELETE FROM session_message", []);
         }
     }
@@ -68,6 +72,7 @@ impl Database {
         configure_connection(&connection)?;
         migrate(&connection)?;
         verify_database(&connection)?;
+        cleanup_interrupted_indexing(&connection)?;
         connection
             .execute("DELETE FROM session_message", [])
             .map_err(|error| format!("No fue posible limpiar el historial de sesión: {error}"))?;
@@ -107,6 +112,28 @@ impl Database {
             .lock()
             .map_err(|_| "No fue posible bloquear la conexión SQLite".to_string())
     }
+}
+
+fn cleanup_interrupted_indexing(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+             DELETE FROM knowledge_item
+             WHERE document_id IN (
+                 SELECT id FROM document WHERE indexing_status != 'completed'
+             );
+             UPDATE document
+             SET indexing_status='pending',
+                 indexed_at=NULL,
+                 last_error='La indexación anterior fue interrumpida y se reiniciará.'
+             WHERE indexing_status NOT IN ('completed', 'failed');
+             UPDATE folder
+             SET scan_status='pending',
+                 last_error='El escaneo anterior fue interrumpido y se reiniciará.'
+             WHERE scan_status='scanning';
+             COMMIT;",
+        )
+        .map_err(|error| format!("No fue posible reconciliar indexaciones interrumpidas: {error}"))
 }
 
 fn register_sqlite_vec() {
@@ -154,7 +181,7 @@ fn migrate(connection: &Connection) -> Result<(), String> {
         2 => connection
             .execute_batch(DOCUMENT_SOURCES_MIGRATION)
             .map_err(|error| format!("Falló la migración de fuentes documentales: {error}")),
-        3 | 4 | 5 | 6 | 7 => Ok(()),
+        3 | 4 | 5 | 6 | 7 | 8 => Ok(()),
         other => Err(format!(
             "La base de datos usa una versión de esquema no compatible: {other}"
         )),
@@ -179,6 +206,11 @@ fn migrate(connection: &Connection) -> Result<(), String> {
         connection
             .execute_batch(FIXED_DOCUMENT_FORMATS_MIGRATION)
             .map_err(|error| format!("Falló la migración de formatos documentales: {error}"))?;
+    }
+    if version < 8 {
+        connection
+            .execute_batch(FOLDER_FORMAT_SELECTION_MIGRATION)
+            .map_err(|error| format!("Falló la migración de selección de formatos: {error}"))?;
     }
     Ok(())
 }
@@ -225,7 +257,7 @@ mod tests {
     fn initial_schema_and_vec_extension_are_available() {
         let (database, path) = temporary_database("schema-test");
         let status = database.status().expect("status should be readable");
-        assert_eq!(status.schema_version, 7);
+        assert_eq!(status.schema_version, 8);
         assert_eq!(status.embedding_dimensions, 1024);
 
         drop(database);
@@ -332,6 +364,95 @@ mod tests {
             connection
                 .execute("DELETE FROM ai_model WHERE id=?1", [model_id])
                 .expect("unused model should delete");
+        }
+        drop(database);
+        remove_database_files(path);
+    }
+
+    #[test]
+    fn nuke_chat_data_preserves_models() {
+        let (database, path) = temporary_database("nuke-test");
+        {
+            let connection = database.connection().expect("connection should lock");
+            connection.execute(
+                "INSERT INTO ai_model(provider,model_key,display_name,endpoint)
+                 VALUES('local','chat','Chat local','')",
+                [],
+            ).expect("model should insert");
+            connection.execute(
+                "INSERT INTO folder(name,canonical_path) VALUES('Temporal','C:/Temporal')",
+                [],
+            ).expect("folder should insert");
+            let folder_id = connection.last_insert_rowid();
+            connection.execute(
+                "INSERT INTO folder_extension(folder_id,extension) VALUES(?1,'txt')",
+                [folder_id],
+            ).expect("extension should insert");
+            connection.execute(
+                "INSERT INTO session_message(scope,folder_id,role,content)
+                 VALUES('folder',?1,'user','dato')",
+                [folder_id],
+            ).expect("message should insert");
+            connection.execute_batch(NUKE_CHAT_DATA).expect("nuke should execute");
+
+            let models: i64 = connection.query_row(
+                "SELECT count(*) FROM ai_model", [], |row| row.get(0),
+            ).expect("models should count");
+            let folders: i64 = connection.query_row(
+                "SELECT count(*) FROM folder", [], |row| row.get(0),
+            ).expect("folders should count");
+            let messages: i64 = connection.query_row(
+                "SELECT count(*) FROM session_message", [], |row| row.get(0),
+            ).expect("messages should count");
+            assert_eq!(models, 1);
+            assert_eq!(folders, 0);
+            assert_eq!(messages, 0);
+        }
+        drop(database);
+        remove_database_files(path);
+    }
+
+    #[test]
+    fn interrupted_document_chunks_are_reconciled() {
+        let (database, path) = temporary_database("interrupted-index-test");
+        {
+            let connection = database.connection().expect("connection should lock");
+            connection.execute(
+                "INSERT INTO folder(name,canonical_path,scan_status)
+                 VALUES('Interrumpida','C:/Interrumpida','scanning')",
+                [],
+            ).expect("folder should insert");
+            let folder_id = connection.last_insert_rowid();
+            connection.execute(
+                "INSERT INTO document(scope,folder_id,relative_path,canonical_path,managed_copy,
+                 size_bytes,modified_at,content_hash,indexing_status)
+                 VALUES('folder',?1,'dato.txt','C:/Interrumpida/dato.txt',1,10,'now','hash','pending')",
+                [folder_id],
+            ).expect("document should insert");
+            let document_id = connection.last_insert_rowid();
+            connection.execute(
+                "INSERT INTO knowledge_item(document_id,folder_id,scope,source_type,content,content_hash)
+                 VALUES(?1,?2,'folder','document_chunk','chunk parcial','partial')",
+                params![document_id, folder_id],
+            ).expect("partial chunk should insert");
+
+            cleanup_interrupted_indexing(&connection).expect("cleanup should succeed");
+
+            let chunks: i64 = connection.query_row(
+                "SELECT count(*) FROM knowledge_item WHERE document_id=?1",
+                [document_id], |row| row.get(0),
+            ).expect("chunks should count");
+            let document_status: String = connection.query_row(
+                "SELECT indexing_status FROM document WHERE id=?1",
+                [document_id], |row| row.get(0),
+            ).expect("document should exist");
+            let folder_status: String = connection.query_row(
+                "SELECT scan_status FROM folder WHERE id=?1",
+                [folder_id], |row| row.get(0),
+            ).expect("folder should exist");
+            assert_eq!(chunks, 0);
+            assert_eq!(document_status, "pending");
+            assert_eq!(folder_status, "pending");
         }
         drop(database);
         remove_database_files(path);

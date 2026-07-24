@@ -134,11 +134,13 @@ pub struct ActivityMetrics {
     pub session_message_count: i64,
     pub session_text_bytes: i64,
     pub mapped_file_count: u64,
+    pub mapped_directory_count: u64,
     pub mapped_folder_bytes: u64,
     pub inaccessible_entry_count: u64,
 }
 
-fn measure_folder_tree(paths: Vec<PathBuf>) -> (u64, u64, u64) {
+fn measure_folder_tree(paths: Vec<PathBuf>) -> (u64, u64, u64, u64) {
+    let mut directory_count = paths.len() as u64;
     let mut stack = paths;
     let mut file_count = 0_u64;
     let mut total_bytes = 0_u64;
@@ -170,6 +172,7 @@ fn measure_folder_tree(paths: Vec<PathBuf>) -> (u64, u64, u64) {
                 continue;
             }
             if metadata.is_dir() {
+                directory_count += 1;
                 stack.push(entry.path());
             } else if metadata.is_file() {
                 file_count += 1;
@@ -177,7 +180,7 @@ fn measure_folder_tree(paths: Vec<PathBuf>) -> (u64, u64, u64) {
             }
         }
     }
-    (file_count, total_bytes, inaccessible)
+    (file_count, directory_count, total_bytes, inaccessible)
 }
 
 #[tauri::command]
@@ -211,7 +214,7 @@ pub async fn get_activity_metrics(database: State<'_, Database>) -> CrudResult<A
             paths,
         )
     };
-    let (mapped_file_count, mapped_folder_bytes, inaccessible_entry_count) =
+    let (mapped_file_count, mapped_directory_count, mapped_folder_bytes, inaccessible_entry_count) =
         tauri::async_runtime::spawn_blocking(move || measure_folder_tree(paths))
             .await
             .map_err(|error| format!("No fue posible medir las carpetas: {error}"))?;
@@ -220,6 +223,7 @@ pub async fn get_activity_metrics(database: State<'_, Database>) -> CrudResult<A
         session_message_count,
         session_text_bytes,
         mapped_file_count,
+        mapped_directory_count,
         mapped_folder_bytes,
         inaccessible_entry_count,
     })
@@ -245,6 +249,7 @@ pub struct Folder {
     pub last_scanned_at: Option<String>,
     pub scan_status: String,
     pub last_error: Option<String>,
+    pub extensions: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -252,6 +257,7 @@ pub struct Folder {
 pub struct CreateFolder {
     pub name: String,
     pub canonical_path: String,
+    pub extensions: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -263,11 +269,42 @@ pub struct UpdateFolder {
     pub last_scanned_at: Option<String>,
     pub scan_status: String,
     pub last_error: Option<String>,
+    pub extensions: Vec<String>,
 }
 
-fn folder_from_row(row: &Row<'_>) -> rusqlite::Result<Folder> {
+const SUPPORTED_DOCUMENT_EXTENSIONS: [&str; 8] =
+    ["pdf", "docx", "json", "md", "txt", "pptx", "rtf", "xml"];
+
+fn validate_folder_extensions(mut extensions: Vec<String>) -> CrudResult<Vec<String>> {
+    extensions.iter_mut().for_each(|value| {
+        *value = value.trim().trim_start_matches('.').to_ascii_lowercase();
+    });
+    extensions.sort();
+    extensions.dedup();
+    if extensions.is_empty() {
+        return Err("Debe permanecer habilitado al menos un formato".into());
+    }
+    if extensions.iter().any(|value| !SUPPORTED_DOCUMENT_EXTENSIONS.contains(&value.as_str())) {
+        return Err("La selección contiene un formato no admitido".into());
+    }
+    Ok(extensions)
+}
+
+fn get_folder_extensions(
+    connection: &rusqlite::Connection,
+    folder_id: i64,
+) -> rusqlite::Result<Vec<String>> {
+    let mut statement = connection.prepare(
+        "SELECT extension FROM folder_extension WHERE folder_id=?1 ORDER BY extension",
+    )?;
+    let result = statement.query_map([folder_id], |row| row.get(0))?.collect();
+    result
+}
+
+fn folder_from_row(connection: &rusqlite::Connection, row: &Row<'_>) -> rusqlite::Result<Folder> {
+    let id = row.get(0)?;
     Ok(Folder {
-        id: row.get(0)?,
+        id,
         name: row.get(1)?,
         canonical_path: row.get(2)?,
         created_at: row.get(3)?,
@@ -275,6 +312,7 @@ fn folder_from_row(row: &Row<'_>) -> rusqlite::Result<Folder> {
         last_scanned_at: row.get(5)?,
         scan_status: row.get(6)?,
         last_error: row.get(7)?,
+        extensions: get_folder_extensions(connection, id)?,
     })
 }
 
@@ -284,7 +322,7 @@ fn get_folder_conn(connection: &rusqlite::Connection, id: i64) -> CrudResult<Fol
             "SELECT id,name,canonical_path,created_at,updated_at,last_scanned_at,scan_status,last_error
              FROM folder WHERE id=?1",
             [id],
-            folder_from_row,
+            |row| folder_from_row(connection, row),
         )
         .optional()
         .map_err(|error| db_error("No fue posible consultar la carpeta", error))?
@@ -295,17 +333,28 @@ fn get_folder_conn(connection: &rusqlite::Connection, id: i64) -> CrudResult<Fol
 pub fn create_folder(input: CreateFolder, database: State<'_, Database>) -> CrudResult<Folder> {
     let name = required_text(&input.name, "name")?;
     let path = required_text(&input.canonical_path, "canonicalPath")?;
+    let extensions = validate_folder_extensions(input.extensions)?;
     if !std::path::Path::new(&path).is_dir() {
         return Err("La ruta seleccionada no existe o no es una carpeta".into());
     }
-    let connection = database.connection()?;
-    connection
+    let mut connection = database.connection()?;
+    let transaction = connection.transaction()
+        .map_err(|error| db_error("No fue posible iniciar la carpeta", error))?;
+    transaction
         .execute(
             "INSERT INTO folder(name,canonical_path,recursive_scan) VALUES(?1,?2,1)",
             params![name, path],
         )
         .map_err(|error| db_error("No fue posible crear la carpeta", error))?;
-    get_folder_conn(&connection, connection.last_insert_rowid())
+    let id = transaction.last_insert_rowid();
+    for extension in extensions {
+        transaction.execute(
+            "INSERT INTO folder_extension(folder_id,extension) VALUES(?1,?2)",
+            params![id, extension],
+        ).map_err(|error| db_error("No fue posible guardar el formato", error))?;
+    }
+    transaction.commit().map_err(|error| db_error("No fue posible confirmar la carpeta", error))?;
+    get_folder_conn(&connection, id)
 }
 
 #[tauri::command]
@@ -324,7 +373,7 @@ pub fn list_folders(database: State<'_, Database>) -> CrudResult<Vec<Folder>> {
         )
         .map_err(|error| db_error("No fue posible preparar la consulta de carpetas", error))?;
     let result = statement
-        .query_map([], folder_from_row)
+        .query_map([], |row| folder_from_row(&connection, row))
         .map_err(|error| db_error("No fue posible listar carpetas", error))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| db_error("No fue posible leer las carpetas", error));
@@ -336,8 +385,11 @@ pub fn update_folder(input: UpdateFolder, database: State<'_, Database>) -> Crud
     let name = required_text(&input.name, "name")?;
     let path = required_text(&input.canonical_path, "canonicalPath")?;
     let status = required_text(&input.scan_status, "scanStatus")?;
-    let connection = database.connection()?;
-    let changed = connection
+    let extensions = validate_folder_extensions(input.extensions)?;
+    let mut connection = database.connection()?;
+    let transaction = connection.transaction()
+        .map_err(|error| db_error("No fue posible iniciar la actualización", error))?;
+    let changed = transaction
         .execute(
             "UPDATE folder SET name=?1,canonical_path=?2,last_scanned_at=?3,scan_status=?4,
              last_error=?5,recursive_scan=1,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?6",
@@ -354,6 +406,15 @@ pub fn update_folder(input: UpdateFolder, database: State<'_, Database>) -> Crud
     if changed == 0 {
         return Err(format!("No existe la carpeta {}", input.id));
     }
+    transaction.execute("DELETE FROM folder_extension WHERE folder_id=?1", [input.id])
+        .map_err(|error| db_error("No fue posible reemplazar formatos", error))?;
+    for extension in extensions {
+        transaction.execute(
+            "INSERT INTO folder_extension(folder_id,extension) VALUES(?1,?2)",
+            params![input.id, extension],
+        ).map_err(|error| db_error("No fue posible guardar el formato", error))?;
+    }
+    transaction.commit().map_err(|error| db_error("No fue posible confirmar los formatos", error))?;
     get_folder_conn(&connection, input.id)
 }
 
@@ -584,8 +645,8 @@ pub fn prepare_folder_scan(
     ).map_err(|error| db_error("No fue posible iniciar el escaneo", error))?;
     let root = std::fs::canonicalize(&folder.canonical_path)
         .map_err(|error| format!("No fue posible resolver la carpeta: {error}"))?;
-    const SUPPORTED_EXTENSIONS: [&str; 8] = ["pdf", "docx", "json", "md", "txt", "pptx", "rtf", "xml"];
-    let paths = match collect_scan_paths(&root, true, &SUPPORTED_EXTENSIONS) {
+    let extensions = folder.extensions.iter().map(String::as_str).collect::<Vec<_>>();
+    let paths = match collect_scan_paths(&root, true, &extensions) {
         Ok(paths) => paths,
         Err(error) => {
             let _ = connection.execute(
@@ -743,12 +804,23 @@ pub fn finish_document_indexing(
     } else {
         ("completed", Some("now"))
     };
-    database.connection()?.execute(
+    let mut connection = database.connection()?;
+    let transaction = connection.transaction()
+        .map_err(|failure| db_error("No fue posible finalizar el documento", failure))?;
+    if error.is_some() {
+        transaction.execute(
+            "DELETE FROM knowledge_item WHERE document_id=?1",
+            [document_id],
+        ).map_err(|failure| db_error("No fue posible retirar chunks parciales", failure))?;
+    }
+    let changed = transaction.execute(
         "UPDATE document SET indexing_status=?1,indexed_at=CASE WHEN ?2 IS NULL THEN NULL
          ELSE strftime('%Y-%m-%dT%H:%M:%fZ','now') END,last_error=?3 WHERE id=?4",
         params![status, indexed_at, error, document_id],
-    ).map(|changed| changed > 0)
-        .map_err(|error| db_error("No fue posible finalizar el documento", error))
+    ).map_err(|failure| db_error("No fue posible finalizar el documento", failure))?;
+    transaction.commit()
+        .map_err(|failure| db_error("No fue posible confirmar el documento", failure))?;
+    Ok(changed > 0)
 }
 
 #[tauri::command]

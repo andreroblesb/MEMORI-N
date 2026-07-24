@@ -4,7 +4,7 @@ body { margin: 0; min-width: 320px; min-height: 100vh; background: #090a0e; }
 button { font: inherit; }
 .app-shell { height: 100vh; display: grid; grid-template-columns: 260px minmax(0, 1fr); overflow: hidden; background: radial-gradient(circle at 68% -20%, rgba(124, 58, 237, .10), transparent 33%), #090a0e; }
 .sidebar { height: 100vh; display: flex; flex-direction: column; padding: 18px 14px 14px; background: rgba(15, 16, 22, .96); border-right: 1px solid #242630; }
-.brand-row { padding: 0 5px 19px; }
+.brand-row { width: 100%; padding: 0 5px 19px; justify-content: space-between; }
 .brand-mark { width: 31px; height: 31px; border-radius: 9px; display: grid; place-items: center; color: white; background: linear-gradient(145deg, #8b5cf6, #5b35b6); box-shadow: 0 7px 22px rgba(124, 58, 237, .3); }
 .brand-name { letter-spacing: -.5px; }
 .search-input { margin: 0 4px 10px; }
@@ -12,6 +12,11 @@ button { font: inherit; }
 .nav-item, .folder-item { width: 100%; height: 38px; border: 0; border-radius: 8px; padding: 0 10px; display: grid; grid-template-columns: 22px 1fr auto; align-items: center; gap: 8px; color: #a9aab4; background: transparent; text-align: left; cursor: pointer; transition: .18s ease; }
 .nav-item:hover, .folder-item:hover { background: #1b1c24; color: #f4f4f7; }
 .nav-item.active, .folder-item.active { background: #252130; color: #d9ccff; }
+.folder-row { width: 100%; display: flex; align-items: center; border-radius: 8px; }
+.folder-row.active { background: #252130; }
+.folder-row .folder-item { min-width: 0; flex: 1; }
+.folder-row-actions { flex: 0 0 auto; padding-right: 3px; }
+.folder-row:has(.folder-row-actions) .folder-item { padding-right: 3px; }
 .shortcut, .folder-count { color: #696b76; font-size: 11px; }
 .folder-status { width: 7px; height: 7px; border-radius: 50%; background: #eab308; box-shadow: 0 0 0 3px rgba(234,179,8,.1); }
 .folder-status.scanning { background: #8b5cf6; box-shadow: 0 0 0 3px rgba(139,92,246,.15); animation: status-pulse 1.2s ease-in-out infinite; }
@@ -34,6 +39,7 @@ button { font: inherit; }
 .attachment-list { max-height: 74px; overflow-y: auto; }.attachment-chip { max-width: 210px; min-width: 0; display: flex; align-items: center; gap: 6px; padding: 5px 6px 5px 8px; border: 1px solid #333541; background: #1c1d25; }.attachment-chip .mantine-Text-root { min-width: 0; }
 .attachment-confirmation { padding: 11px 12px; border: 1px solid rgba(139,92,246,.45); background: rgba(92,58,180,.12); }
 .folder-scan-notice { border: 1px solid #30323b; background: #191a22; }
+.folder-delete-zone { border: 1px solid rgba(239,68,68,.3); background: rgba(127,29,29,.08); }
 .messages-area { height: calc(100vh - 60px); padding: 12px 28px 180px; }
 .message.assistant { flex-direction: row; }.message.user { flex-direction: row-reverse; }
 .message-bubble { max-width: 650px; padding: 13px 16px; border: 1px solid #2a2c35; background: #171820; }

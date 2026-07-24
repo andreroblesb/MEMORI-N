@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
@@ -10,6 +11,7 @@ import {
   Button,
   Card,
   Center,
+  Checkbox,
   Group,
   Loader,
   Modal,
@@ -34,6 +36,7 @@ import {
   IconInfoCircle,
   IconMessage,
   IconPlus,
+  IconRefresh,
   IconSearch,
   IconSend,
   IconSettings,
@@ -42,7 +45,7 @@ import {
 } from "@tabler/icons-react";
 import "./App.css";
 import { MarkdownMessage } from "./components/MarkdownMessage";
-import { completeChat, createEmbedding, extractDocumentChunks, extractKnowledge } from "./services/chatApi";
+import { cancelPendingRequests, completeChat, createEmbedding, extractDocumentChunks, extractKnowledge } from "./services/chatApi";
 
 type View = "chat" | "analytics";
 type Folder = {
@@ -52,6 +55,7 @@ type Folder = {
   scanStatus: string;
   lastError: string | null;
   lastScannedAt: string | null;
+  extensions: string[];
 };
 type Message = { role: "user" | "assistant"; content: string };
 const INTRO_MESSAGE: Message = {
@@ -84,6 +88,7 @@ type ActivityMetrics = {
   sessionMessageCount: number;
   sessionTextBytes: number;
   mappedFileCount: number;
+  mappedDirectoryCount: number;
   mappedFolderBytes: number;
   inaccessibleEntryCount: number;
 };
@@ -101,7 +106,7 @@ const scanLabel = (status: string) => ({
   pending: "Pendiente",
   scanning: "Indexando",
   completed: "Indexada",
-  failed: "Con errores",
+  failed: "Con errores de indexación. Reporte el problema.",
 }[status] ?? status);
 const scanColor = (status: string) => ({
   pending: "yellow",
@@ -137,11 +142,15 @@ function App() {
   const [folderModal, setFolderModal] = useState(false);
   const [folderBusy, setFolderBusy] = useState(false);
   const [folderError, setFolderError] = useState("");
+  const [editingFolders, setEditingFolders] = useState(false);
   const [settingsModal, setSettingsModal] = useState(false);
   const [folderDraft, setFolderDraft] = useState<{ id?: number; name: string; path: string } | null>(null);
+  const [folderExtensions, setFolderExtensions] = useState<string[]>(SUPPORTED_DOCUMENT_FORMATS.map((format) => format.slice(1)));
+  const [confirmFolderDelete, setConfirmFolderDelete] = useState(false);
   const [prompt, setPrompt] = useState("");
   const [messages, setMessages] = useState<Message[]>([INTRO_MESSAGE]);
   const [chatBusy, setChatBusy] = useState(false);
+  const [busyChatFolderId, setBusyChatFolderId] = useState<number | null | undefined>(undefined);
   const [chatError, setChatError] = useState("");
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [pendingAttachment, setPendingAttachment] = useState<string | null>(null);
@@ -179,6 +188,19 @@ function App() {
     }).catch((error) => setFolderError(String(error)));
   }, []);
 
+  useEffect(() => {
+    const cancel = () => cancelPendingRequests();
+    window.addEventListener("beforeunload", cancel);
+    const closeListener = inTauri()
+      ? getCurrentWindow().onCloseRequested(cancel)
+      : null;
+    return () => {
+      window.removeEventListener("beforeunload", cancel);
+      cancel();
+      void closeListener?.then((unlisten) => unlisten());
+    };
+  }, []);
+
   const openChat = async (folderId: number | null) => {
     selectedFolderRef.current = folderId;
     setSelectedFolder(folderId);
@@ -208,6 +230,7 @@ function App() {
     setPrompt("");
     setChatError("");
     setChatBusy(true);
+    setBusyChatFolderId(targetFolder);
     setMessages(nextMessages);
     setDocuments([]);
     try {
@@ -266,6 +289,7 @@ function App() {
       setChatError(error instanceof Error ? error.message : String(error));
     } finally {
       setChatBusy(false);
+      setBusyChatFolderId(undefined);
     }
   };
 
@@ -281,9 +305,20 @@ function App() {
       const normalized = selected.replace(/[\\/]+$/, "");
       const name = normalized.split(/[\\/]/).pop() || normalized;
       setFolderDraft({ name, path: normalized });
+      setFolderExtensions(SUPPORTED_DOCUMENT_FORMATS.map((format) => format.slice(1)));
+      setConfirmFolderDelete(false);
+      setFolderModal(true);
     } catch (error) {
       setFolderError(String(error));
     }
+  };
+
+  const editFolderConfiguration = (folder: Folder) => {
+    setFolderDraft({ id: folder.id, name: folder.name, path: folder.canonicalPath });
+    setFolderExtensions(folder.extensions);
+    setConfirmFolderDelete(false);
+    setFolderError("");
+    setFolderModal(true);
   };
 
   const scanFolder = async (folder: Folder) => {
@@ -345,12 +380,14 @@ function App() {
               lastScannedAt: existing?.lastScannedAt ?? null,
               scanStatus: "pending",
               lastError: null,
+              extensions: folderExtensions,
             },
           })
         : await invoke<Folder>("create_folder", {
             input: {
               name: folderDraft.name,
               canonicalPath: folderDraft.path,
+              extensions: folderExtensions,
             },
           });
       replaceFolder(folder);
@@ -370,6 +407,9 @@ function App() {
       try { await invoke("delete_folder", { id }); } catch (error) { setFolderError(String(error)); return; }
     }
     setFolders((current) => current.filter((folder) => folder.id !== id));
+    setFolderModal(false);
+    setFolderDraft(null);
+    setConfirmFolderDelete(false);
     if (selectedFolder === id) {
       selectedFolderRef.current = null;
       setSelectedFolder(null);
@@ -429,11 +469,16 @@ function App() {
             <Box className="brand-mark">M</Box>
             <Text fw={750} size="lg" className="brand-name">MEMORIÓN</Text>
           </Group>
+          <Tooltip label="Configuración">
+            <ActionIcon variant="subtle" color="gray" aria-label="Configuración" onClick={() => setSettingsModal(true)}>
+              <IconSettings size={19} />
+            </ActionIcon>
+          </Tooltip>
         </Group>
 
         <Stack gap={4} mt="lg">
           <button className={`nav-item ${view === "chat" && selectedFolder === null ? "active" : ""}`} onClick={() => openChat(null)}>
-            <IconMessage size={18} /><span>Chat general</span><span className="shortcut">⌘ K</span>
+            <IconMessage size={18} /><span>Chat general</span>
           </button>
           <button className={`nav-item ${view === "analytics" ? "active" : ""}`} onClick={() => setView("analytics")}>
             <IconChartBar size={18} /><span>Actividad</span>
@@ -442,11 +487,14 @@ function App() {
 
         <Group justify="space-between" mt="xl" mb={7} px={8}>
           <Text size="xs" fw={700} c="dimmed" tt="uppercase" lts={1.1}>Carpetas</Text>
-          <Tooltip label="Editar chats de carpeta">
-            <ActionIcon variant="subtle" color="gray" size="sm" aria-label="Editar chats de carpeta" onClick={() => setFolderModal(true)}>
-              <IconEdit size={16} />
-            </ActionIcon>
-          </Tooltip>
+          <Group gap={2}>
+            {editingFolders && <Tooltip label="Crear chat de carpeta"><ActionIcon variant="subtle" color="gray" size="sm" aria-label="Crear chat de carpeta" onClick={selectFolder}><IconPlus size={16} /></ActionIcon></Tooltip>}
+            <Tooltip label={editingFolders ? "Terminar edición" : "Editar configuraciones"}>
+              <ActionIcon variant={editingFolders ? "light" : "subtle"} color={editingFolders ? "violet" : "gray"} size="sm" aria-label="Editar configuraciones" onClick={() => setEditingFolders((value) => !value)}>
+                <IconEdit size={16} />
+              </ActionIcon>
+            </Tooltip>
+          </Group>
         </Group>
         <TextInput
           value={search}
@@ -459,15 +507,17 @@ function App() {
         <ScrollArea className="folder-scroll">
           <Stack gap={3}>
             {folders.filter((folder) => folder.name.toLowerCase().includes(search.toLowerCase())).map((folder) => (
-              <button
-                key={folder.id}
-                className={`folder-item ${selectedFolder === folder.id ? "active" : ""}`}
-                onClick={() => openChat(folder.id)}
-              >
-                <IconFolder size={17} color="var(--mantine-color-violet-4)" />
-                <span>{folder.name}</span>
-                <span className={`folder-status ${folder.scanStatus}`} title={scanLabel(folder.scanStatus)} />
-              </button>
+              <div key={folder.id} className={`folder-row ${selectedFolder === folder.id ? "active" : ""}`}>
+                <button className="folder-item" onClick={() => openChat(folder.id)}>
+                  <IconFolder size={17} color="var(--mantine-color-violet-4)" />
+                  <span>{folder.name}</span>
+                  <span className={`folder-status ${folder.scanStatus}`} title={scanLabel(folder.scanStatus)} />
+                </button>
+                {editingFolders && <Group gap={0} wrap="nowrap" className="folder-row-actions">
+                  <Tooltip label={`Reindexar ${folder.name}`}><ActionIcon variant="subtle" color="gray" size="sm" aria-label={`Reindexar ${folder.name}`} loading={folder.scanStatus === "scanning"} onClick={() => void scanFolder(folder)}><IconRefresh size={15} /></ActionIcon></Tooltip>
+                  <Tooltip label={`Modificar ${folder.name}`}><ActionIcon variant="subtle" color="gray" size="sm" aria-label={`Modificar ${folder.name}`} onClick={() => editFolderConfiguration(folder)}><IconSettings size={15} /></ActionIcon></Tooltip>
+                </Group>}
+              </div>
             ))}
           </Stack>
         </ScrollArea>
@@ -479,9 +529,6 @@ function App() {
           <Group gap="xs">
             {view === "chat" && <><Text fw={650}>{activeFolder ? `Chat · ${activeFolder.name}` : "Chat general"}</Text>{activeFolder ? <Tooltip label={activeFolder.lastError || `Estado del análisis: ${scanLabel(activeFolder.scanStatus)}`} multiline w={280}><Badge variant="light" color={scanColor(activeFolder.scanStatus)} size="sm">{scanLabel(activeFolder.scanStatus)}</Badge></Tooltip> : <Badge variant="light" color="gray" size="sm">Sin carpeta</Badge>}</>}
             {view === "analytics" && <Text fw={650}>Actividad y uso</Text>}
-          </Group>
-          <Group gap="xs">
-            <Tooltip label="Configuración"><ActionIcon variant="subtle" color="gray" aria-label="Configuración" onClick={() => setSettingsModal(true)}><IconSettings size={20} /></ActionIcon></Tooltip>
           </Group>
         </header>
 
@@ -515,7 +562,7 @@ function App() {
                     <Group align="flex-start" wrap="nowrap" className="message assistant">
                       <Avatar size={34} radius="xl" color="violet"><IconMessage size={17} /></Avatar>
                       <Paper className="message-bubble">
-                        <Group gap="xs"><Loader size="xs" color="violet" /><Text size="sm" c="dimmed">Pensando…</Text></Group>
+                        <Group gap="xs"><Loader size="xs" color="violet" /><Text size="sm" c="dimmed">{busyChatFolderId === selectedFolder ? "Pensando…" : "Pensando en otro chat…"}</Text></Group>
                       </Paper>
                     </Group>
                   )}
@@ -531,44 +578,38 @@ function App() {
           </section>
         )}
 
-        {view === "analytics" && <Analytics onReport={reportIssue} />}
+        {view === "analytics" && <Analytics />}
       </main>
 
-      <Modal opened={folderModal} onClose={() => setFolderModal(false)} title="Editar carpetas" centered overlayProps={{ backgroundOpacity: 0.65, blur: 5 }}>
-        {folderDraft ? (
-          <Stack gap="md">
-            <div><Text fw={650}>Nueva carpeta</Text><Text size="xs" c="dimmed" truncate>{folderDraft.path}</Text></div>
-            <Paper p="md" className="folder-scan-notice">
-              <Text size="sm" fw={600}>Análisis automático de documentos</Text>
-              <Text size="xs" c="dimmed" mt={4}>MEMORIÓN escaneará esta carpeta y sus subcarpetas. Los enlaces simbólicos se omiten.</Text>
-              <Group gap={6} mt="sm">
-                {SUPPORTED_DOCUMENT_FORMATS.map((format) => <Badge key={format} variant="light" color="violet">{format}</Badge>)}
-              </Group>
-              <Text size="xs" c="dimmed" mt="sm">CSV y XLSX todavía no se indexan.</Text>
-            </Paper>
-          </Stack>
-        ) : (
-          <>
-            <Text size="sm" c="dimmed" mb="md">Los chats escanean automáticamente los formatos documentales admitidos dentro de la carpeta y sus subcarpetas.</Text>
-            <Stack gap={8} className="edit-folder-list">
-              {folders.length === 0 && <Text size="sm" c="dimmed" ta="center" py="md">Todavía no hay carpetas registradas.</Text>}
-              {folders.map((folder) => (
-                <Paper key={folder.id} className="edit-folder-row">
-                  <Group justify="space-between" wrap="nowrap">
-                    <Group gap="sm" wrap="nowrap" className="folder-detail"><ThemeIcon variant="light" color="violet" size={32}><IconFolder size={17} /></ThemeIcon><div><Text size="sm" fw={600}>{folder.name}</Text><Text size="xs" c="dimmed" truncate>{folder.canonicalPath}</Text><Text size="xs" c={scanColor(folder.scanStatus)}>{scanLabel(folder.scanStatus)}</Text></div></Group>
-                    <Tooltip label={`Eliminar ${folder.name}`}><ActionIcon variant="subtle" color="red" aria-label={`Eliminar ${folder.name}`} onClick={() => deleteFolder(folder.id)}><IconTrash size={17} /></ActionIcon></Tooltip>
-                  </Group>
-                </Paper>
-              ))}
-            </Stack>
-          </>
-        )}
+      <Modal opened={folderModal} onClose={() => { setFolderModal(false); setFolderDraft(null); setConfirmFolderDelete(false); }} title={folderDraft?.id ? "Modificar chat de carpeta" : "Nuevo chat de carpeta"} centered overlayProps={{ backgroundOpacity: 0.65, blur: 5 }}>
+        {folderDraft && <Stack gap="md">
+          <div><Text fw={650}>{folderDraft.name}</Text><Text size="xs" c="dimmed" truncate>{folderDraft.path}</Text></div>
+          <Paper p="md" className="folder-scan-notice">
+            <Text size="sm" fw={600}>Formatos que se indexarán</Text>
+            <Text size="xs" c="dimmed" mt={4}>El escaneo incluye subcarpetas y omite enlaces simbólicos.</Text>
+            <SimpleGrid cols={2} spacing="xs" mt="md">
+              {SUPPORTED_DOCUMENT_FORMATS.map((format) => {
+                const extension = format.slice(1);
+                return <Checkbox key={format} label={format} checked={folderExtensions.includes(extension)}
+                  onChange={(event) => setFolderExtensions((current) => event.currentTarget.checked
+                    ? [...new Set([...current, extension])]
+                    : current.filter((item) => item !== extension))} />;
+              })}
+            </SimpleGrid>
+            <Text size="xs" c="dimmed" mt="sm">CSV y XLSX todavía no se indexan.</Text>
+          </Paper>
+          {folderDraft.id && <Paper p="md" className="folder-delete-zone">
+            <Text size="sm" fw={600} c="red.4">Eliminar este chat</Text>
+            <Text size="xs" c="dimmed" mt={3}>Se eliminarán sus documentos registrados, historial de sesión, conocimientos y embeddings. Los archivos físicos no se borrarán.</Text>
+            {confirmFolderDelete
+              ? <Group gap="xs" mt="sm"><Button size="xs" color="red" onClick={() => deleteFolder(folderDraft.id!)}>Confirmar eliminación</Button><Button size="xs" variant="subtle" color="gray" onClick={() => setConfirmFolderDelete(false)}>Cancelar</Button></Group>
+              : <Button size="xs" variant="light" color="red" leftSection={<IconTrash size={15} />} mt="sm" onClick={() => setConfirmFolderDelete(true)}>Eliminar chat</Button>}
+          </Paper>}
+        </Stack>}
         {folderError && <Text size="sm" c="red.4" mt="md">{folderError}</Text>}
         <Group justify="space-between" mt="xl">
-          <Button variant="subtle" color="gray" onClick={() => folderDraft ? setFolderDraft(null) : setFolderModal(false)}>{folderDraft ? "Atrás" : "Cerrar"}</Button>
-          {folderDraft
-            ? <Button onClick={saveFolderConfiguration} loading={folderBusy}>Crear e indexar</Button>
-            : <Button leftSection={<IconPlus size={17} />} onClick={selectFolder}>Seleccionar carpeta</Button>}
+          <Button variant="subtle" color="gray" onClick={() => { setFolderModal(false); setFolderDraft(null); }}>Cancelar</Button>
+          <Button onClick={saveFolderConfiguration} loading={folderBusy}>{folderDraft?.id ? "Guardar y reindexar" : "Crear e indexar"}</Button>
         </Group>
       </Modal>
       <Modal opened={settingsModal} onClose={() => setSettingsModal(false)} title="Configuración" centered size="sm" overlayProps={{ backgroundOpacity: 0.65, blur: 5 }}>
@@ -635,7 +676,7 @@ function formatBytes(bytes: number): string {
   return `${value.toFixed(value >= 10 ? 1 : 2)} ${unit}`;
 }
 
-function Analytics({ onReport }: { onReport: () => void }) {
+function Analytics() {
   const [cpu, setCpu] = useState<number[]>(Array(12).fill(0));
   const [ram, setRam] = useState<number[]>(Array(12).fill(0));
   const [metrics, setMetrics] = useState<SystemMetrics>({ cpuPercent: 0, ramUsedBytes: 0, ramTotalBytes: 0 });
@@ -674,10 +715,7 @@ function Analytics({ onReport }: { onReport: () => void }) {
   ];
   return (
     <section className="analytics-view"><div className="analytics-container">
-      <Group className="analytics-heading" justify="space-between" align="flex-end">
-        <div><Text size="sm" c="violet.3" fw={650}>Estado de la sesión actual</Text><Title order={2} mt={2}>Tu actividad</Title><Text c="dimmed" size="sm" mt={3}>Datos locales medidos directamente por MEMORIÓN.</Text></div>
-        <Button variant="light" color="gray" leftSection={<IconFlag size={17} />} onClick={onReport}>Reportar</Button>
-      </Group>
+      <div className="analytics-heading"><Text size="sm" c="violet.3" fw={650}>Estado de la sesión actual</Text><Title order={2} mt={2}>Tu actividad</Title><Text c="dimmed" size="sm" mt={3}>Datos locales medidos directamente por MEMORIÓN.</Text></div>
       <SimpleGrid cols={3} spacing="md" className="metrics-grid">
         {cards.map((metric) => <Card key={metric.label} className="metric-card"><Group justify="space-between"><ThemeIcon variant="light" color="violet" size={34}><metric.icon size={18} /></ThemeIcon>{metric.tooltip ? <Tooltip label={metric.tooltip} multiline w={280}><Badge className="metric-help-badge" variant="light" color="teal">{metric.delta}</Badge></Tooltip> : <Badge variant="light" color="teal">{metric.delta}</Badge>}</Group><Text size="xl" fw={750} mt="sm">{metric.value}</Text><Text size="sm" c="dimmed">{metric.label}</Text></Card>)}
       </SimpleGrid>
@@ -697,10 +735,10 @@ function Analytics({ onReport }: { onReport: () => void }) {
                 </Group>
               </Paper>
               <Paper className="storage-detail">
-                <Text fw={700}>{activity?.folderChatCount ?? "—"}</Text>
+                <Text fw={700}>{activity?.mappedDirectoryCount ?? "—"}</Text>
                 <Group gap={4} wrap="nowrap">
-                  <Text size="xs" c="dimmed">Carpetas raíz</Text>
-                  <Tooltip label="Carpetas que registraste directamente como chats. No incluye sus subcarpetas." multiline w={240}>
+                  <Text size="xs" c="dimmed">Carpetas encontradas</Text>
+                  <Tooltip label="Total de carpetas encontradas: incluye las carpetas raíz registradas como chats y todas sus subcarpetas accesibles." multiline w={260}>
                     <IconInfoCircle className="metric-info" size={14} />
                   </Tooltip>
                 </Group>

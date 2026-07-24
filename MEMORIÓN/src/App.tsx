@@ -45,7 +45,7 @@ import {
 } from "@tabler/icons-react";
 import "./App.css";
 import { MarkdownMessage } from "./components/MarkdownMessage";
-import { cancelPendingRequests, completeChat, createEmbedding, extractDocumentChunks, extractKnowledge } from "./services/chatApi";
+import { cancelPendingRequests, completeChat, createEmbedding, extractDocumentChunks, extractKnowledge, waitForBackendReady } from "./services/chatApi";
 
 type View = "chat" | "analytics";
 type Folder = {
@@ -158,6 +158,7 @@ function App() {
   const [attachmentError, setAttachmentError] = useState("");
   const [search, setSearch] = useState("");
   const selectedFolderRef = useRef<number | null>(null);
+  const startupScanStarted = useRef(false);
 
   const replaceFolder = (folder: Folder) => {
     setFolders((current) => [...current.filter((item) => item.id !== folder.id), folder]
@@ -183,6 +184,7 @@ function App() {
       invoke<Folder[]>("list_folders"),
       invoke<Message[]>("list_session_messages", { folderId: null }),
     ]).then(([nextFolders, nextMessages]) => {
+      if (nextFolders.length === 0) startupScanStarted.current = true;
       setFolders(nextFolders);
       setMessages(nextMessages.length > 0 ? nextMessages : [INTRO_MESSAGE]);
     }).catch((error) => setFolderError(String(error)));
@@ -326,6 +328,7 @@ function App() {
     let scanError: string | null = null;
     try {
       const candidates = await invoke<ScanCandidate[]>("prepare_folder_scan", { folderId: folder.id });
+      if (candidates.length > 0) await waitForBackendReady();
       for (const candidate of candidates) {
         try {
           const chunks = await extractDocumentChunks(candidate.canonicalPath, candidate.extension);
@@ -362,6 +365,16 @@ function App() {
       replaceFolder({ ...folder, scanStatus: "failed", lastError: String(error) });
     }
   };
+
+  useEffect(() => {
+    if (!inTauri() || startupScanStarted.current || folders.length === 0) return;
+    startupScanStarted.current = true;
+    void (async () => {
+      for (const folder of folders) {
+        await scanFolder(folder);
+      }
+    })();
+  }, [folders]);
 
   const saveFolderConfiguration = async () => {
     if (!folderDraft) return;

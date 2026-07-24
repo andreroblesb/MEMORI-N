@@ -16,6 +16,40 @@ export function cancelPendingRequests(): void {
   pendingRequests.clear();
 }
 
+const wait = (milliseconds: number) => new Promise<void>((resolve) => {
+  window.setTimeout(resolve, milliseconds);
+});
+
+export async function waitForBackendReady(timeoutMs = 180_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastDetail = "FastAPI todavía no está disponible.";
+  while (Date.now() < deadline) {
+    const controller = new AbortController();
+    pendingRequests.add(controller);
+    try {
+      const response = await fetch(`${BACKEND_URL}/health`, { signal: controller.signal });
+      if (response.ok) {
+        const payload = (await response.json()) as { status?: string };
+        if (payload.status === "ready") return;
+        if (payload.status === "failed") {
+          throw new Error("FastAPI no pudo preparar los modelos.");
+        }
+        lastDetail = "Los modelos todavía se están preparando.";
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        throw new Error("La operación fue cancelada.");
+      }
+      if (error instanceof Error && error.message.includes("no pudo preparar")) throw error;
+      lastDetail = "FastAPI todavía no está disponible.";
+    } finally {
+      pendingRequests.delete(controller);
+    }
+    await wait(1_000);
+  }
+  throw new Error(`${lastDetail} Se agotó el tiempo de espera.`);
+}
+
 async function postJson<T>(path: string, body: object): Promise<T> {
   let response: Response;
   const controller = new AbortController();

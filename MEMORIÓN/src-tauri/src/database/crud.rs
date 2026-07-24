@@ -3,6 +3,7 @@ use rusqlite::{params, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     fs::File,
     io::Read,
     path::{Path, PathBuf},
@@ -656,31 +657,41 @@ pub fn prepare_folder_scan(
             return Err(error);
         }
     };
-    let mut seen = Vec::new();
+    let mut seen = HashSet::new();
     let mut candidates = Vec::new();
     for path in paths {
         let canonical = std::fs::canonicalize(&path)
             .map_err(|error| format!("No fue posible resolver {}: {error}", path.display()))?;
         let canonical_text = canonical.to_string_lossy().into_owned();
-        seen.push(canonical_text.clone());
+        seen.insert(canonical_text.clone());
         let relative = canonical.strip_prefix(&root)
             .unwrap_or(&canonical)
             .to_string_lossy()
             .replace('\\', "/");
         let metadata = std::fs::metadata(&canonical)
             .map_err(|error| format!("No fue posible leer {}: {error}", canonical.display()))?;
-        let hash = hash_file(&canonical)?;
         let modified = metadata.modified().ok()
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|value| format!("unix:{}", value.as_secs()))
             .unwrap_or_else(|| "unknown".into());
-        let existing: Option<(i64, String, String)> = connection.query_row(
-            "SELECT id,content_hash,indexing_status FROM document
+        let existing: Option<(i64, String, String, i64, String)> = connection.query_row(
+            "SELECT id,content_hash,indexing_status,size_bytes,modified_at FROM document
              WHERE scope='folder' AND folder_id=?1 AND relative_path=?2",
             params![folder_id, relative],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         ).optional().map_err(|error| db_error("No fue posible consultar el documento", error))?;
-        let (document_id, requires_indexing) = if let Some((id, old_hash, status)) = existing {
+        let (document_id, requires_indexing) = if let Some((id, old_hash, status, old_size, old_modified)) = existing {
+            if status == "completed"
+                && old_size == metadata.len() as i64
+                && old_modified == modified
+            {
+                connection.execute(
+                    "UPDATE document SET canonical_path=?1 WHERE id=?2",
+                    params![canonical_text, id],
+                ).map_err(|error| db_error("No fue posible actualizar la ruta", error))?;
+                (id, false)
+            } else {
+            let hash = hash_file(&canonical)?;
             let changed = old_hash != hash || status != "completed";
             if changed {
                 connection.execute("DELETE FROM knowledge_item WHERE document_id=?1", [id])
@@ -691,9 +702,17 @@ pub fn prepare_folder_scan(
                      WHERE id=?6",
                     params![canonical_text, metadata.len() as i64, modified, hash, mime_from_path(&canonical), id],
                 ).map_err(|error| db_error("No fue posible actualizar el documento", error))?;
+            } else {
+                connection.execute(
+                    "UPDATE document SET canonical_path=?1,size_bytes=?2,modified_at=?3,last_error=NULL
+                     WHERE id=?4",
+                    params![canonical_text, metadata.len() as i64, modified, id],
+                ).map_err(|error| db_error("No fue posible actualizar metadatos", error))?;
             }
             (id, changed)
+            }
         } else {
+            let hash = hash_file(&canonical)?;
             let (volume_id, file_id) = file_identity(&canonical)?;
             connection.execute(
                 "INSERT INTO document(scope,folder_id,relative_path,canonical_path,volume_id,file_id,

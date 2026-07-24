@@ -21,6 +21,11 @@ from .services.ai.memory_service import (
     MemoryAiService,
 )
 from .services.ai.model_manager import ModelManager
+from .services.documents import (
+    DocumentChunkRequest,
+    DocumentChunkResponse,
+    DocumentProcessor,
+)
 
 
 model_logger, model_log_path = configure_model_logging()
@@ -32,6 +37,7 @@ memory_ai_service: MemoryAiService | None = None
 chat_model_lock = Lock()
 embedding_model_lock = Lock()
 initialization_task: asyncio.Task[None] | None = None
+document_processor = DocumentProcessor()
 
 
 async def initialize_models() -> None:
@@ -156,6 +162,17 @@ async def embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
     except Exception as exc:
         model_logger.exception("La generación de embedding falló")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/documents/chunks", response_model=DocumentChunkResponse)
+async def document_chunks(request: DocumentChunkRequest) -> DocumentChunkResponse:
+    try:
+        return await asyncio.to_thread(document_processor.extract_and_chunk, request)
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        model_logger.exception("La extracción del documento falló")
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.post("/api/knowledge/extract", response_model=KnowledgeExtractionResponse)

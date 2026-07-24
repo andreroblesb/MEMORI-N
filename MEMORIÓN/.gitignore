@@ -1,3 +1,6 @@
+# excluir carpeta test
+test/
+
 venv/
 __pycache__/
 *.py[cod]

@@ -6,6 +6,7 @@ export type ChatMessage = {
 type ChatResponse = { content: string };
 type EmbeddingResponse = { embedding: number[]; dimensions: number };
 export type KnowledgeExtraction = { should_store: boolean; content: string | null };
+export type DocumentChunk = { content: string; chunk_index: number; token_count: number };
 
 const BACKEND_URL = "http://127.0.0.1:8000";
 
@@ -59,4 +60,15 @@ export async function createEmbedding(text: string): Promise<number[]> {
 
 export function extractKnowledge(messages: ChatMessage[]): Promise<KnowledgeExtraction> {
   return postJson<KnowledgeExtraction>("/api/knowledge/extract", { messages });
+}
+
+export async function extractDocumentChunks(
+  path: string,
+  extension: string,
+): Promise<DocumentChunk[]> {
+  const response = await postJson<{ chunks: DocumentChunk[] }>("/api/documents/chunks", {
+    path,
+    extension,
+  });
+  return response.chunks;
 }

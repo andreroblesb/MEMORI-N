@@ -301,7 +301,7 @@ pub fn create_folder(input: CreateFolder, database: State<'_, Database>) -> Crud
     let connection = database.connection()?;
     connection
         .execute(
-            "INSERT INTO folder(name,canonical_path) VALUES(?1,?2)",
+            "INSERT INTO folder(name,canonical_path,recursive_scan) VALUES(?1,?2,1)",
             params![name, path],
         )
         .map_err(|error| db_error("No fue posible crear la carpeta", error))?;
@@ -340,7 +340,7 @@ pub fn update_folder(input: UpdateFolder, database: State<'_, Database>) -> Crud
     let changed = connection
         .execute(
             "UPDATE folder SET name=?1,canonical_path=?2,last_scanned_at=?3,scan_status=?4,
-             last_error=?5,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?6",
+             last_error=?5,recursive_scan=1,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?6",
             params![
                 name,
                 path,
@@ -524,6 +524,248 @@ pub fn delete_document(id: i64, database: State<'_, Database>) -> CrudResult<boo
         .execute("DELETE FROM document WHERE id=?1", [id])
         .map(|changed| changed > 0)
         .map_err(|error| db_error("No fue posible eliminar el documento", error))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanCandidate {
+    pub document_id: i64,
+    pub canonical_path: String,
+    pub relative_path: String,
+    pub extension: String,
+}
+
+fn collect_scan_paths(
+    root: &Path,
+    recursive: bool,
+    extensions: &[&str],
+) -> CrudResult<Vec<PathBuf>> {
+    let mut directories = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(directory) = directories.pop() {
+        let entries = std::fs::read_dir(&directory)
+            .map_err(|error| format!("No fue posible leer {}: {error}", directory.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("No fue posible leer una entrada: {error}"))?;
+            let path = entry.path();
+            let metadata = path.symlink_metadata()
+                .map_err(|error| format!("No fue posible leer {}: {error}", path.display()))?;
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                if recursive {
+                    directories.push(path);
+                }
+                continue;
+            }
+            let extension = path.extension()
+                .and_then(|value| value.to_str())
+                .map(str::to_ascii_lowercase);
+            if metadata.is_file() && extension.as_ref().is_some_and(|value| extensions.contains(&value.as_str())) {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+#[tauri::command]
+pub fn prepare_folder_scan(
+    folder_id: i64,
+    database: State<'_, Database>,
+) -> CrudResult<Vec<ScanCandidate>> {
+    let connection = database.connection()?;
+    let folder = get_folder_conn(&connection, folder_id)?;
+    connection.execute(
+        "UPDATE folder SET scan_status='scanning',last_error=NULL WHERE id=?1",
+        [folder_id],
+    ).map_err(|error| db_error("No fue posible iniciar el escaneo", error))?;
+    let root = std::fs::canonicalize(&folder.canonical_path)
+        .map_err(|error| format!("No fue posible resolver la carpeta: {error}"))?;
+    const SUPPORTED_EXTENSIONS: [&str; 8] = ["pdf", "docx", "json", "md", "txt", "pptx", "rtf", "xml"];
+    let paths = match collect_scan_paths(&root, true, &SUPPORTED_EXTENSIONS) {
+        Ok(paths) => paths,
+        Err(error) => {
+            let _ = connection.execute(
+                "UPDATE folder SET scan_status='failed',last_error=?1 WHERE id=?2",
+                params![error, folder_id],
+            );
+            return Err(error);
+        }
+    };
+    let mut seen = Vec::new();
+    let mut candidates = Vec::new();
+    for path in paths {
+        let canonical = std::fs::canonicalize(&path)
+            .map_err(|error| format!("No fue posible resolver {}: {error}", path.display()))?;
+        let canonical_text = canonical.to_string_lossy().into_owned();
+        seen.push(canonical_text.clone());
+        let relative = canonical.strip_prefix(&root)
+            .unwrap_or(&canonical)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let metadata = std::fs::metadata(&canonical)
+            .map_err(|error| format!("No fue posible leer {}: {error}", canonical.display()))?;
+        let hash = hash_file(&canonical)?;
+        let modified = metadata.modified().ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|value| format!("unix:{}", value.as_secs()))
+            .unwrap_or_else(|| "unknown".into());
+        let existing: Option<(i64, String, String)> = connection.query_row(
+            "SELECT id,content_hash,indexing_status FROM document
+             WHERE scope='folder' AND folder_id=?1 AND relative_path=?2",
+            params![folder_id, relative],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional().map_err(|error| db_error("No fue posible consultar el documento", error))?;
+        let (document_id, requires_indexing) = if let Some((id, old_hash, status)) = existing {
+            let changed = old_hash != hash || status != "completed";
+            if changed {
+                connection.execute("DELETE FROM knowledge_item WHERE document_id=?1", [id])
+                    .map_err(|error| db_error("No fue posible limpiar chunks anteriores", error))?;
+                connection.execute(
+                    "UPDATE document SET canonical_path=?1,size_bytes=?2,modified_at=?3,
+                     content_hash=?4,mime_type=?5,indexing_status='pending',indexed_at=NULL,last_error=NULL
+                     WHERE id=?6",
+                    params![canonical_text, metadata.len() as i64, modified, hash, mime_from_path(&canonical), id],
+                ).map_err(|error| db_error("No fue posible actualizar el documento", error))?;
+            }
+            (id, changed)
+        } else {
+            let (volume_id, file_id) = file_identity(&canonical)?;
+            connection.execute(
+                "INSERT INTO document(scope,folder_id,relative_path,canonical_path,volume_id,file_id,
+                 managed_copy,mime_type,size_bytes,modified_at,content_hash,indexing_status)
+                 VALUES('folder',?1,?2,?3,?4,?5,1,?6,?7,?8,?9,'pending')",
+                params![folder_id, relative, canonical_text, volume_id, file_id,
+                    mime_from_path(&canonical), metadata.len() as i64, modified, hash],
+            ).map_err(|error| db_error("No fue posible registrar el documento", error))?;
+            (connection.last_insert_rowid(), true)
+        };
+        if requires_indexing {
+            candidates.push(ScanCandidate {
+                document_id,
+                canonical_path: canonical_text,
+                relative_path: relative,
+                extension: canonical.extension().and_then(|value| value.to_str())
+                    .unwrap_or_default().to_ascii_lowercase(),
+            });
+        }
+    }
+    let mut statement = connection.prepare(
+        "SELECT id,canonical_path FROM document WHERE scope='folder' AND folder_id=?1",
+    ).map_err(|error| db_error("No fue posible reconciliar documentos", error))?;
+    let stale = statement.query_map([folder_id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|error| db_error("No fue posible consultar documentos previos", error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| db_error("No fue posible leer documentos previos", error))?;
+    drop(statement);
+    for (id, path) in stale {
+        if !seen.contains(&path) {
+            connection.execute("DELETE FROM document WHERE id=?1", [id])
+                .map_err(|error| db_error("No fue posible retirar un documento eliminado", error))?;
+        }
+    }
+    Ok(candidates)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoreDocumentChunk {
+    pub folder_id: i64,
+    pub document_id: i64,
+    pub content: String,
+    pub chunk_index: i64,
+    pub token_count: i64,
+    pub embedding: Vec<f32>,
+}
+
+#[tauri::command]
+pub fn store_document_chunk(
+    input: StoreDocumentChunk,
+    database: State<'_, Database>,
+) -> CrudResult<i64> {
+    let content = required_text(&input.content, "content")?;
+    let embedding_json = vector_json(&input.embedding)?;
+    let content_hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let mut connection = database.connection()?;
+    let transaction = connection.transaction()
+        .map_err(|error| db_error("No fue posible iniciar el guardado del chunk", error))?;
+    let valid: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM document WHERE id=?1 AND folder_id=?2)",
+        params![input.document_id, input.folder_id],
+        |row| row.get(0),
+    ).map_err(|error| db_error("No fue posible validar el documento", error))?;
+    if !valid {
+        return Err("El documento no pertenece a la carpeta indicada".into());
+    }
+    transaction.execute(
+        "INSERT OR IGNORE INTO ai_model(provider,model_key,display_name,version,endpoint,enabled)
+         VALUES('local','embedding','Modelo de embeddings local','1','',1)",
+        [],
+    ).map_err(|error| db_error("No fue posible registrar el modelo", error))?;
+    let model_id: i64 = transaction.query_row(
+        "SELECT id FROM ai_model WHERE provider='local' AND model_key='embedding' AND endpoint=''",
+        [], |row| row.get(0),
+    ).map_err(|error| db_error("No fue posible consultar el modelo", error))?;
+    transaction.execute(
+        "INSERT INTO model_capability(model_id,capability,embedding_dimensions,distance_metric)
+         VALUES(?1,'embedding',?2,'cosine')
+         ON CONFLICT(model_id,capability) DO UPDATE SET embedding_dimensions=excluded.embedding_dimensions",
+        params![model_id, EMBEDDING_DIMENSIONS],
+    ).map_err(|error| db_error("No fue posible registrar la capacidad", error))?;
+    transaction.execute(
+        "INSERT INTO knowledge_item(document_id,folder_id,scope,source_type,content,content_hash,
+         is_confirmed,chunk_index,token_count,location_metadata)
+         VALUES(?1,?2,'folder','document_chunk',?3,?4,1,?5,?6,?7)",
+        params![input.document_id, input.folder_id, content, content_hash, input.chunk_index,
+            input.token_count, serde_json::json!({"document_id": input.document_id}).to_string()],
+    ).map_err(|error| db_error("No fue posible guardar el chunk", error))?;
+    let knowledge_id = transaction.last_insert_rowid();
+    transaction.execute(
+        "INSERT INTO knowledge_vector(knowledge_id,embedding,embedding_model_id,scope,folder_id)
+         VALUES(?1,vec_f32(?2),?3,'folder',?4)",
+        params![knowledge_id, embedding_json, model_id, input.folder_id],
+    ).map_err(|error| db_error("No fue posible guardar el vector del chunk", error))?;
+    transaction.commit().map_err(|error| db_error("No fue posible confirmar el chunk", error))?;
+    Ok(knowledge_id)
+}
+
+#[tauri::command]
+pub fn finish_document_indexing(
+    document_id: i64,
+    error: Option<String>,
+    database: State<'_, Database>,
+) -> CrudResult<bool> {
+    let (status, indexed_at) = if error.is_some() {
+        ("failed", None)
+    } else {
+        ("completed", Some("now"))
+    };
+    database.connection()?.execute(
+        "UPDATE document SET indexing_status=?1,indexed_at=CASE WHEN ?2 IS NULL THEN NULL
+         ELSE strftime('%Y-%m-%dT%H:%M:%fZ','now') END,last_error=?3 WHERE id=?4",
+        params![status, indexed_at, error, document_id],
+    ).map(|changed| changed > 0)
+        .map_err(|error| db_error("No fue posible finalizar el documento", error))
+}
+
+#[tauri::command]
+pub fn finish_folder_scan(
+    folder_id: i64,
+    error: Option<String>,
+    database: State<'_, Database>,
+) -> CrudResult<Folder> {
+    let status = if error.is_some() { "failed" } else { "completed" };
+    let connection = database.connection()?;
+    connection.execute(
+        "UPDATE folder SET scan_status=?1,last_error=?2,
+         last_scanned_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+         updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?3",
+        params![status, error, folder_id],
+    ).map_err(|error| db_error("No fue posible finalizar el escaneo", error))?;
+    get_folder_conn(&connection, folder_id)
 }
 
 fn hash_file(path: &Path) -> CrudResult<String> {
@@ -1367,6 +1609,7 @@ pub struct StoredChatKnowledge {
 #[tauri::command]
 pub fn store_general_chat_knowledge(
     input: StoreChatKnowledge,
+    folder_id: Option<i64>,
     database: State<'_, Database>,
 ) -> CrudResult<StoredChatKnowledge> {
     let user_input = required_text(&input.user_input, "userInput")?;
@@ -1385,6 +1628,7 @@ pub fn store_general_chat_knowledge(
     hasher.update(content.as_bytes());
     let content_hash = format!("{:x}", hasher.finalize());
     let mut connection = database.connection()?;
+    let scope = if folder_id.is_some() { "folder" } else { "general" };
     let transaction = connection
         .transaction()
         .map_err(|error| db_error("No fue posible iniciar la memoria", error))?;
@@ -1392,8 +1636,8 @@ pub fn store_general_chat_knowledge(
     let existing: Option<i64> = transaction
         .query_row(
             "SELECT id FROM knowledge_item
-             WHERE scope='general' AND content_hash=?1 LIMIT 1",
-            [&content_hash],
+             WHERE scope=?1 AND folder_id IS ?2 AND content_hash=?3 LIMIT 1",
+            params![scope, folder_id, content_hash],
             |row| row.get(0),
         )
         .optional()
@@ -1448,8 +1692,8 @@ pub fn store_general_chat_knowledge(
     transaction
         .execute(
             "INSERT INTO knowledge_origin(scope,folder_id,user_input)
-             VALUES('general',NULL,?1)",
-            [&user_input],
+             VALUES(?1,?2,?3)",
+            params![scope, folder_id, user_input],
         )
         .map_err(|error| db_error("No fue posible guardar el origen del conocimiento", error))?;
     let origin_id = transaction.last_insert_rowid();
@@ -1462,9 +1706,9 @@ pub fn store_general_chat_knowledge(
         .execute(
             "INSERT INTO knowledge_item(
                 origin_id,generator_model_id,scope,source_type,content,content_hash,
-                is_confirmed,location_metadata
-             ) VALUES(?1,?2,'general','chat_statement',?3,?4,1,?5)",
-            params![origin_id, chat_model_id, content, content_hash, metadata],
+                folder_id,is_confirmed,location_metadata
+             ) VALUES(?1,?2,?3,'chat_statement',?4,?5,?6,1,?7)",
+            params![origin_id, chat_model_id, scope, content, content_hash, folder_id, metadata],
         )
         .map_err(|error| db_error("No fue posible guardar el conocimiento", error))?;
     let knowledge_id = transaction.last_insert_rowid();
@@ -1472,8 +1716,8 @@ pub fn store_general_chat_knowledge(
         .execute(
             "INSERT INTO knowledge_vector(
                 knowledge_id,embedding,embedding_model_id,scope,folder_id
-             ) VALUES(?1,vec_f32(?2),?3,'general',0)",
-            params![knowledge_id, embedding_json, embedding_model_id],
+             ) VALUES(?1,vec_f32(?2),?3,?4,?5)",
+            params![knowledge_id, embedding_json, embedding_model_id, scope, folder_id.unwrap_or(0)],
         )
         .map_err(|error| db_error("No fue posible guardar el vector del conocimiento", error))?;
     transaction

@@ -16,8 +16,12 @@ from .services.ai.logging_config import configure_model_logging
 from .services.ai.memory_service import (
     EmbeddingRequest,
     EmbeddingResponse,
+    DocumentKnowledgeRequest,
+    KnowledgeCandidatesResponse,
     KnowledgeExtractionRequest,
     KnowledgeExtractionResponse,
+    KnowledgeRefinementRequest,
+    KnowledgeRefinementResponse,
     MemoryAiService,
 )
 from .services.ai.model_manager import ModelManager
@@ -185,4 +189,33 @@ async def extract_knowledge(
         return await asyncio.to_thread(memory_ai_service.extract, request)
     except Exception as exc:
         model_logger.exception("La extracción de conocimiento falló")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/knowledge/document/extract",
+    response_model=KnowledgeCandidatesResponse,
+)
+async def extract_document_knowledge(
+    request: DocumentKnowledgeRequest,
+) -> KnowledgeCandidatesResponse:
+    if memory_ai_service is None:
+        raise HTTPException(status_code=503, detail="Los modelos todavía se están preparando.")
+    try:
+        return await asyncio.to_thread(memory_ai_service.extract_document, request)
+    except Exception as exc:
+        model_logger.exception("La extracción documental falló")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/knowledge/refine", response_model=KnowledgeRefinementResponse)
+async def refine_knowledge(
+    request: KnowledgeRefinementRequest,
+) -> KnowledgeRefinementResponse:
+    if memory_ai_service is None:
+        raise HTTPException(status_code=503, detail="Los modelos todavía se están preparando.")
+    try:
+        return await asyncio.to_thread(memory_ai_service.refine, request)
+    except Exception as exc:
+        model_logger.exception("La revisión de conocimiento falló")
         raise HTTPException(status_code=500, detail=str(exc)) from exc

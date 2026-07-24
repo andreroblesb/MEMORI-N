@@ -15,6 +15,7 @@ const EMBEDDING_1024_MIGRATION: &str = include_str!("../migrations/0005_embeddin
 const FOLDER_INDEXING_MIGRATION: &str = include_str!("../migrations/0006_folder_indexing.sql");
 const FIXED_DOCUMENT_FORMATS_MIGRATION: &str = include_str!("../migrations/0007_fixed_document_formats.sql");
 const FOLDER_FORMAT_SELECTION_MIGRATION: &str = include_str!("../migrations/0008_folder_format_selection.sql");
+const REFINED_DOCUMENT_KNOWLEDGE_MIGRATION: &str = include_str!("../migrations/0009_refined_document_knowledge.sql");
 #[cfg(test)]
 const NUKE_CHAT_DATA: &str = include_str!("../maintenance/nuke_chat_data.sql");
 pub const EMBEDDING_DIMENSIONS: u32 = 1024;
@@ -181,7 +182,7 @@ fn migrate(connection: &Connection) -> Result<(), String> {
         2 => connection
             .execute_batch(DOCUMENT_SOURCES_MIGRATION)
             .map_err(|error| format!("Falló la migración de fuentes documentales: {error}")),
-        3 | 4 | 5 | 6 | 7 | 8 => Ok(()),
+        3 | 4 | 5 | 6 | 7 | 8 | 9 => Ok(()),
         other => Err(format!(
             "La base de datos usa una versión de esquema no compatible: {other}"
         )),
@@ -211,6 +212,11 @@ fn migrate(connection: &Connection) -> Result<(), String> {
         connection
             .execute_batch(FOLDER_FORMAT_SELECTION_MIGRATION)
             .map_err(|error| format!("Falló la migración de selección de formatos: {error}"))?;
+    }
+    if version < 9 {
+        connection
+            .execute_batch(REFINED_DOCUMENT_KNOWLEDGE_MIGRATION)
+            .map_err(|error| format!("Falló la migración de conocimientos refinados: {error}"))?;
     }
     Ok(())
 }
@@ -257,7 +263,7 @@ mod tests {
     fn initial_schema_and_vec_extension_are_available() {
         let (database, path) = temporary_database("schema-test");
         let status = database.status().expect("status should be readable");
-        assert_eq!(status.schema_version, 8);
+        assert_eq!(status.schema_version, 9);
         assert_eq!(status.embedding_dimensions, 1024);
 
         drop(database);

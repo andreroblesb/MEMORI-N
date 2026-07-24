@@ -758,6 +758,8 @@ pub struct StoreDocumentChunk {
     pub content: String,
     pub chunk_index: i64,
     pub token_count: i64,
+    pub source_chunk_hash: String,
+    pub source_excerpt: String,
     pub embedding: Vec<f32>,
 }
 
@@ -767,6 +769,8 @@ pub fn store_document_chunk(
     database: State<'_, Database>,
 ) -> CrudResult<i64> {
     let content = required_text(&input.content, "content")?;
+    let source_chunk_hash = required_text(&input.source_chunk_hash, "sourceChunkHash")?;
+    let source_excerpt = required_text(&input.source_excerpt, "sourceExcerpt")?;
     let embedding_json = vector_json(&input.embedding)?;
     let content_hash = format!("{:x}", Sha256::digest(content.as_bytes()));
     let mut connection = database.connection()?;
@@ -780,6 +784,15 @@ pub fn store_document_chunk(
     if !valid {
         return Err("El documento no pertenece a la carpeta indicada".into());
     }
+    transaction.execute(
+        "INSERT OR IGNORE INTO ai_model(provider,model_key,display_name,version,endpoint,enabled)
+         VALUES('local','chat','Modelo conversacional local','1','',1)",
+        [],
+    ).map_err(|error| db_error("No fue posible registrar el modelo conversacional", error))?;
+    let generator_model_id: i64 = transaction.query_row(
+        "SELECT id FROM ai_model WHERE provider='local' AND model_key='chat' AND endpoint=''",
+        [], |row| row.get(0),
+    ).map_err(|error| db_error("No fue posible consultar el modelo conversacional", error))?;
     transaction.execute(
         "INSERT OR IGNORE INTO ai_model(provider,model_key,display_name,version,endpoint,enabled)
          VALUES('local','embedding','Modelo de embeddings local','1','',1)",
@@ -796,11 +809,16 @@ pub fn store_document_chunk(
         params![model_id, EMBEDDING_DIMENSIONS],
     ).map_err(|error| db_error("No fue posible registrar la capacidad", error))?;
     transaction.execute(
-        "INSERT INTO knowledge_item(document_id,folder_id,scope,source_type,content,content_hash,
+        "INSERT INTO knowledge_item(document_id,folder_id,generator_model_id,scope,source_type,content,content_hash,
          is_confirmed,chunk_index,token_count,location_metadata)
-         VALUES(?1,?2,'folder','document_chunk',?3,?4,1,?5,?6,?7)",
-        params![input.document_id, input.folder_id, content, content_hash, input.chunk_index,
-            input.token_count, serde_json::json!({"document_id": input.document_id}).to_string()],
+         VALUES(?1,?2,?3,'folder','document_knowledge',?4,?5,1,?6,?7,?8)",
+        params![input.document_id, input.folder_id, generator_model_id, content, content_hash, input.chunk_index,
+            input.token_count, serde_json::json!({
+                "document_id": input.document_id,
+                "source_chunk_hash": source_chunk_hash,
+                "source_excerpt": source_excerpt.chars().take(280).collect::<String>(),
+                "refinement": "two_pass"
+            }).to_string()],
     ).map_err(|error| db_error("No fue posible guardar el chunk", error))?;
     let knowledge_id = transaction.last_insert_rowid();
     transaction.execute(
@@ -1325,6 +1343,126 @@ pub fn delete_knowledge_item(id: i64, database: State<'_, Database>) -> CrudResu
         .map_err(|error| db_error("No fue posible eliminar el conocimiento", error))
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeLog {
+    pub id: i64,
+    pub content: String,
+    pub scope: String,
+    pub source_type: String,
+    pub folder_id: Option<i64>,
+    pub folder_name: Option<String>,
+    pub document_id: Option<i64>,
+    pub document_path: Option<String>,
+    pub origin_id: Option<i64>,
+    pub user_input: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[tauri::command]
+pub fn list_recent_knowledge_logs(
+    limit: u32,
+    database: State<'_, Database>,
+) -> CrudResult<Vec<KnowledgeLog>> {
+    if limit == 0 || limit > 200 {
+        return Err("limit debe estar entre 1 y 200".into());
+    }
+    let connection = database.connection()?;
+    list_recent_knowledge_logs_conn(&connection, limit)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviseKnowledgeItem {
+    pub id: i64,
+    pub content: String,
+    pub embedding: Vec<f32>,
+}
+
+#[tauri::command]
+pub fn revise_knowledge_item(
+    input: ReviseKnowledgeItem,
+    database: State<'_, Database>,
+) -> CrudResult<KnowledgeLog> {
+    let content = required_text(&input.content, "content")?;
+    let embedding_json = vector_json(&input.embedding)?;
+    let content_hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let mut connection = database.connection()?;
+    let transaction = connection.transaction()
+        .map_err(|error| db_error("No fue posible iniciar la corrección", error))?;
+    let vector: (i64, String, i64) = transaction.query_row(
+        "SELECT embedding_model_id,scope,folder_id
+         FROM knowledge_vector WHERE knowledge_id=?1",
+        [input.id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).optional()
+        .map_err(|error| db_error("No fue posible consultar el vector", error))?
+        .ok_or_else(|| format!("El conocimiento {} no tiene un vector asociado", input.id))?;
+    let metadata: Option<String> = transaction.query_row(
+        "SELECT location_metadata FROM knowledge_item WHERE id=?1",
+        [input.id],
+        |row| row.get(0),
+    ).optional()
+        .map_err(|error| db_error("No fue posible consultar el conocimiento", error))?
+        .ok_or_else(|| format!("No existe el conocimiento {}", input.id))?;
+    let mut metadata_json = metadata
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(object) = metadata_json.as_object_mut() {
+        object.insert("manual_revision".into(), serde_json::json!(true));
+    }
+    transaction.execute(
+        "UPDATE knowledge_item
+         SET content=?1,content_hash=?2,is_confirmed=1,token_count=?3,
+             location_metadata=?4,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE id=?5",
+        params![content, content_hash, (content.chars().count() / 4).max(1) as i64,
+            metadata_json.to_string(), input.id],
+    ).map_err(|error| db_error("No fue posible actualizar el conocimiento", error))?;
+    transaction.execute("DELETE FROM knowledge_vector WHERE knowledge_id=?1", [input.id])
+        .map_err(|error| db_error("No fue posible retirar el vector anterior", error))?;
+    transaction.execute(
+        "INSERT INTO knowledge_vector(knowledge_id,embedding,embedding_model_id,scope,folder_id)
+         VALUES(?1,vec_f32(?2),?3,?4,?5)",
+        params![input.id, embedding_json, vector.0, vector.1, vector.2],
+    ).map_err(|error| db_error("No fue posible guardar el vector corregido", error))?;
+    transaction.commit()
+        .map_err(|error| db_error("No fue posible confirmar la corrección", error))?;
+
+    let logs = list_recent_knowledge_logs_conn(&connection, 200)?;
+    logs.into_iter().find(|item| item.id == input.id)
+        .ok_or_else(|| format!("No fue posible recuperar el conocimiento {}", input.id))
+}
+
+fn list_recent_knowledge_logs_conn(
+    connection: &rusqlite::Connection,
+    limit: u32,
+) -> CrudResult<Vec<KnowledgeLog>> {
+    let mut statement = connection.prepare(
+        "SELECT knowledge_item.id,knowledge_item.content,knowledge_item.scope,
+                knowledge_item.source_type,knowledge_item.folder_id,folder.name,
+                knowledge_item.document_id,document.relative_path,
+                knowledge_item.origin_id,knowledge_origin.user_input,
+                knowledge_item.created_at,knowledge_item.updated_at
+         FROM knowledge_item
+         LEFT JOIN folder ON folder.id=knowledge_item.folder_id
+         LEFT JOIN document ON document.id=knowledge_item.document_id
+         LEFT JOIN knowledge_origin ON knowledge_origin.id=knowledge_item.origin_id
+         ORDER BY knowledge_item.id DESC LIMIT ?1",
+    ).map_err(|error| db_error("No fue posible preparar los knowledge logs", error))?;
+    let result = statement.query_map([limit], |row| Ok(KnowledgeLog {
+        id: row.get(0)?, content: row.get(1)?, scope: row.get(2)?,
+        source_type: row.get(3)?, folder_id: row.get(4)?, folder_name: row.get(5)?,
+        document_id: row.get(6)?, document_path: row.get(7)?, origin_id: row.get(8)?,
+        user_input: row.get(9)?, created_at: row.get(10)?, updated_at: row.get(11)?,
+    })).map_err(|error| db_error("No fue posible consultar los knowledge logs", error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| db_error("No fue posible leer los knowledge logs", error));
+    result
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiModel {
@@ -1683,18 +1821,24 @@ pub struct KnowledgeContextMessage {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct StoreChatKnowledgeItem {
+    pub content: String,
+    pub embedding: Vec<f32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StoreChatKnowledge {
     pub user_input: String,
-    pub content: String,
     pub context_messages: Vec<KnowledgeContextMessage>,
-    pub embedding: Vec<f32>,
+    pub items: Vec<StoreChatKnowledgeItem>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoredChatKnowledge {
-    pub knowledge_id: i64,
-    pub created: bool,
+    pub knowledge_ids: Vec<i64>,
+    pub created_count: usize,
 }
 
 #[tauri::command]
@@ -1704,7 +1848,9 @@ pub fn store_general_chat_knowledge(
     database: State<'_, Database>,
 ) -> CrudResult<StoredChatKnowledge> {
     let user_input = required_text(&input.user_input, "userInput")?;
-    let content = required_text(&input.content, "content")?;
+    if input.items.is_empty() || input.items.len() > 20 {
+        return Err("items debe contener entre uno y veinte conocimientos".into());
+    }
     if input.context_messages.len() > 4 {
         return Err("contextMessages admite como máximo cuatro mensajes".into());
     }
@@ -1714,31 +1860,17 @@ pub fn store_general_chat_knowledge(
         }
         required_text(&message.content, "contextMessages.content")?;
     }
-    let embedding_json = vector_json(&input.embedding)?;
-    let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
-    let content_hash = format!("{:x}", hasher.finalize());
+    let prepared = input.items.iter().map(|item| {
+        let content = required_text(&item.content, "items.content")?;
+        let embedding_json = vector_json(&item.embedding)?;
+        let content_hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+        Ok((content, content_hash, embedding_json))
+    }).collect::<CrudResult<Vec<_>>>()?;
     let mut connection = database.connection()?;
     let scope = if folder_id.is_some() { "folder" } else { "general" };
     let transaction = connection
         .transaction()
         .map_err(|error| db_error("No fue posible iniciar la memoria", error))?;
-
-    let existing: Option<i64> = transaction
-        .query_row(
-            "SELECT id FROM knowledge_item
-             WHERE scope=?1 AND folder_id IS ?2 AND content_hash=?3 LIMIT 1",
-            params![scope, folder_id, content_hash],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| db_error("No fue posible buscar conocimiento duplicado", error))?;
-    if let Some(knowledge_id) = existing {
-        return Ok(StoredChatKnowledge {
-            knowledge_id,
-            created: false,
-        });
-    }
 
     transaction
         .execute(
@@ -1790,33 +1922,50 @@ pub fn store_general_chat_knowledge(
     let origin_id = transaction.last_insert_rowid();
     let metadata = serde_json::json!({
         "context_messages": input.context_messages,
-        "capture": "automatic_chat_statement"
+        "capture": "automatic_chat_statement",
+        "refinement": "two_pass"
     })
     .to_string();
-    transaction
-        .execute(
+    let mut knowledge_ids = Vec::new();
+    let mut created_count = 0_usize;
+    for (content, content_hash, embedding_json) in prepared {
+        let existing: Option<i64> = transaction.query_row(
+            "SELECT id FROM knowledge_item
+             WHERE scope=?1 AND folder_id IS ?2 AND content_hash=?3 LIMIT 1",
+            params![scope, folder_id, content_hash],
+            |row| row.get(0),
+        ).optional().map_err(|error| db_error("No fue posible buscar conocimiento duplicado", error))?;
+        if let Some(id) = existing {
+            knowledge_ids.push(id);
+            continue;
+        }
+        transaction.execute(
             "INSERT INTO knowledge_item(
                 origin_id,generator_model_id,scope,source_type,content,content_hash,
                 folder_id,is_confirmed,location_metadata
              ) VALUES(?1,?2,?3,'chat_statement',?4,?5,?6,1,?7)",
             params![origin_id, chat_model_id, scope, content, content_hash, folder_id, metadata],
-        )
-        .map_err(|error| db_error("No fue posible guardar el conocimiento", error))?;
-    let knowledge_id = transaction.last_insert_rowid();
-    transaction
-        .execute(
+        ).map_err(|error| db_error("No fue posible guardar el conocimiento", error))?;
+        let knowledge_id = transaction.last_insert_rowid();
+        transaction.execute(
             "INSERT INTO knowledge_vector(
                 knowledge_id,embedding,embedding_model_id,scope,folder_id
              ) VALUES(?1,vec_f32(?2),?3,?4,?5)",
             params![knowledge_id, embedding_json, embedding_model_id, scope, folder_id.unwrap_or(0)],
-        )
-        .map_err(|error| db_error("No fue posible guardar el vector del conocimiento", error))?;
+        ).map_err(|error| db_error("No fue posible guardar el vector del conocimiento", error))?;
+        knowledge_ids.push(knowledge_id);
+        created_count += 1;
+    }
+    if created_count == 0 {
+        transaction.execute("DELETE FROM knowledge_origin WHERE id=?1", [origin_id])
+            .map_err(|error| db_error("No fue posible retirar un origen duplicado", error))?;
+    }
     transaction
         .commit()
         .map_err(|error| db_error("No fue posible confirmar la memoria", error))?;
     Ok(StoredChatKnowledge {
-        knowledge_id,
-        created: true,
+        knowledge_ids,
+        created_count,
     })
 }
 

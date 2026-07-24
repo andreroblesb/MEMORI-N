@@ -16,6 +16,7 @@ import {
   Loader,
   Modal,
   Paper,
+  Progress,
   ScrollArea,
   SimpleGrid,
   Stack,
@@ -28,6 +29,8 @@ import {
 } from "@mantine/core";
 import {
   IconActivity,
+  IconAlertTriangle,
+  IconBook2,
   IconChartBar,
   IconEdit,
   IconFlag,
@@ -45,9 +48,9 @@ import {
 } from "@tabler/icons-react";
 import "./App.css";
 import { MarkdownMessage } from "./components/MarkdownMessage";
-import { cancelPendingRequests, completeChat, createEmbedding, extractDocumentChunks, extractKnowledge, waitForBackendReady } from "./services/chatApi";
+import { cancelPendingRequests, completeChat, createEmbedding, extractDocumentChunks, extractDocumentKnowledge, extractKnowledge, refineKnowledge, waitForBackendReady } from "./services/chatApi";
 
-type View = "chat" | "analytics";
+type View = "chat" | "analytics" | "knowledge";
 type Folder = {
   id: number;
   name: string;
@@ -93,11 +96,31 @@ type ActivityMetrics = {
   inaccessibleEntryCount: number;
 };
 type KnowledgeMatch = { knowledge: { content: string }; distance: number };
+type KnowledgeLog = {
+  id: number;
+  content: string;
+  scope: "general" | "folder";
+  sourceType: string;
+  folderId: number | null;
+  folderName: string | null;
+  documentId: number | null;
+  documentPath: string | null;
+  originId: number | null;
+  userInput: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
 type ScanCandidate = {
   documentId: number;
   canonicalPath: string;
   relativePath: string;
   extension: string;
+};
+type ScanProgress = {
+  completedFiles: number;
+  totalFiles: number;
+  percent: number;
+  currentFile: string | null;
 };
 
 const SUPPORTED_DOCUMENT_FORMATS = [".pdf", ".docx", ".json", ".md", ".txt", ".pptx", ".rtf", ".xml"];
@@ -116,6 +139,12 @@ const scanColor = (status: string) => ({
 }[status] ?? "gray");
 
 const inTauri = () => "__TAURI_INTERNALS__" in window;
+
+async function sha256Text(value: string): Promise<string> {
+  const bytes = new TextEncoder().encode(value);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
 
 function recentKnowledgeContext(messages: Message[]): Message[] {
   const selected: Message[] = [];
@@ -156,9 +185,11 @@ function App() {
   const [pendingAttachment, setPendingAttachment] = useState<string | null>(null);
   const [attachmentBusy, setAttachmentBusy] = useState(false);
   const [attachmentError, setAttachmentError] = useState("");
+  const [scanProgress, setScanProgress] = useState<Record<number, ScanProgress>>({});
   const [search, setSearch] = useState("");
   const selectedFolderRef = useRef<number | null>(null);
   const startupScanStarted = useRef(false);
+  const scanningFolders = useRef(new Set<number>());
 
   const replaceFolder = (folder: Folder) => {
     setFolders((current) => [...current.filter((item) => item.id !== folder.id), folder]
@@ -275,14 +306,18 @@ function App() {
             { role: "user", content: clean },
           ]);
           if (!extraction.should_store || !extraction.content) return;
-          const embedding = await createEmbedding(extraction.content);
+          const refined = await refineKnowledge([extraction.content], "chat");
+          const items = [];
+          for (const content of refined) {
+            items.push({ content, embedding: await createEmbedding(content) });
+          }
+          if (items.length === 0) return;
           await invoke("store_general_chat_knowledge", {
             folderId: targetFolder,
             input: {
               userInput: clean,
-              content: extraction.content,
               contextMessages,
-              embedding,
+              items,
             },
           });
         })().catch((error) => console.error("No se pudo crear knowledge item", error));
@@ -324,26 +359,68 @@ function App() {
   };
 
   const scanFolder = async (folder: Folder) => {
+    if (scanningFolders.current.has(folder.id)) return;
+    scanningFolders.current.add(folder.id);
+    setScanProgress((current) => ({
+      ...current,
+      [folder.id]: { completedFiles: 0, totalFiles: 0, percent: 0, currentFile: null },
+    }));
     replaceFolder({ ...folder, scanStatus: "scanning", lastError: null });
     let scanError: string | null = null;
     try {
-      const candidates = await invoke<ScanCandidate[]>("prepare_folder_scan", { folderId: folder.id });
-      if (candidates.length > 0) await waitForBackendReady();
-      for (const candidate of candidates) {
+      const files = await invoke<ScanCandidate[]>("prepare_folder_scan", { folderId: folder.id });
+      setScanProgress((current) => ({
+        ...current,
+        [folder.id]: {
+          completedFiles: 0,
+          totalFiles: files.length,
+          percent: files.length === 0 ? 100 : 0,
+          currentFile: files[0]?.relativePath ?? null,
+        },
+      }));
+      if (files.length > 0) await waitForBackendReady();
+      for (let fileIndex = 0; fileIndex < files.length; fileIndex += 1) {
+        const candidate = files[fileIndex];
+        setScanProgress((current) => ({
+          ...current,
+          [folder.id]: {
+            completedFiles: fileIndex,
+            totalFiles: files.length,
+            percent: (fileIndex / files.length) * 100,
+            currentFile: candidate.relativePath,
+          },
+        }));
         try {
           const chunks = await extractDocumentChunks(candidate.canonicalPath, candidate.extension);
-          for (const chunk of chunks) {
-            const embedding = await createEmbedding(chunk.content);
-            await invoke("store_document_chunk", {
-              input: {
-                folderId: folder.id,
-                documentId: candidate.documentId,
-                content: chunk.content,
-                chunkIndex: chunk.chunk_index,
-                tokenCount: chunk.token_count,
-                embedding,
+          for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
+            const chunk = chunks[chunkIndex];
+            const knowledgeCandidates = await extractDocumentKnowledge(chunk.content);
+            const refined = await refineKnowledge(knowledgeCandidates, "document");
+            const sourceChunkHash = await sha256Text(chunk.content);
+            for (const content of refined) {
+              const embedding = await createEmbedding(content);
+              await invoke("store_document_chunk", {
+                input: {
+                  folderId: folder.id,
+                  documentId: candidate.documentId,
+                  content,
+                  chunkIndex: chunk.chunk_index,
+                  tokenCount: Math.max(1, Math.floor(content.length / 4)),
+                  sourceChunkHash,
+                  sourceExcerpt: chunk.content.slice(0, 280),
+                  embedding,
+                },
+              });
+            }
+            setScanProgress((current) => ({
+              ...current,
+              [folder.id]: {
+                completedFiles: fileIndex,
+                totalFiles: files.length,
+                percent: ((fileIndex + ((chunkIndex + 1) / chunks.length)) / files.length) * 100,
+                currentFile: candidate.relativePath,
               },
-            });
+            }));
           }
           await invoke("finish_document_indexing", { documentId: candidate.documentId, error: null });
         } catch (error) {
@@ -351,6 +428,15 @@ function App() {
           await invoke("finish_document_indexing", { documentId: candidate.documentId, error: message });
           scanError = scanError ?? `Algunos documentos no pudieron analizarse: ${message}`;
         }
+        setScanProgress((current) => ({
+          ...current,
+          [folder.id]: {
+            completedFiles: fileIndex + 1,
+            totalFiles: files.length,
+            percent: ((fileIndex + 1) / files.length) * 100,
+            currentFile: files[fileIndex + 1]?.relativePath ?? null,
+          },
+        }));
       }
     } catch (error) {
       scanError = error instanceof Error ? error.message : String(error);
@@ -363,6 +449,15 @@ function App() {
       replaceFolder(updated);
     } catch (error) {
       replaceFolder({ ...folder, scanStatus: "failed", lastError: String(error) });
+    } finally {
+      scanningFolders.current.delete(folder.id);
+      window.setTimeout(() => {
+        setScanProgress((current) => {
+          const next = { ...current };
+          delete next[folder.id];
+          return next;
+        });
+      }, 700);
     }
   };
 
@@ -496,6 +591,9 @@ function App() {
           <button className={`nav-item ${view === "analytics" ? "active" : ""}`} onClick={() => setView("analytics")}>
             <IconChartBar size={18} /><span>Actividad</span>
           </button>
+          <button className={`nav-item ${view === "knowledge" ? "active" : ""}`} onClick={() => setView("knowledge")}>
+            <IconBook2 size={18} /><span>Knowledge Logs</span>
+          </button>
         </Stack>
 
         <Group justify="space-between" mt="xl" mb={7} px={8}>
@@ -520,16 +618,31 @@ function App() {
         <ScrollArea className="folder-scroll">
           <Stack gap={3}>
             {folders.filter((folder) => folder.name.toLowerCase().includes(search.toLowerCase())).map((folder) => (
-              <div key={folder.id} className={`folder-row ${selectedFolder === folder.id ? "active" : ""}`}>
-                <button className="folder-item" onClick={() => openChat(folder.id)}>
-                  <IconFolder size={17} color="var(--mantine-color-violet-4)" />
-                  <span>{folder.name}</span>
-                  <span className={`folder-status ${folder.scanStatus}`} title={scanLabel(folder.scanStatus)} />
-                </button>
-                {editingFolders && <Group gap={0} wrap="nowrap" className="folder-row-actions">
-                  <Tooltip label={`Reindexar ${folder.name}`}><ActionIcon variant="subtle" color="gray" size="sm" aria-label={`Reindexar ${folder.name}`} loading={folder.scanStatus === "scanning"} onClick={() => void scanFolder(folder)}><IconRefresh size={15} /></ActionIcon></Tooltip>
-                  <Tooltip label={`Modificar ${folder.name}`}><ActionIcon variant="subtle" color="gray" size="sm" aria-label={`Modificar ${folder.name}`} onClick={() => editFolderConfiguration(folder)}><IconSettings size={15} /></ActionIcon></Tooltip>
-                </Group>}
+              <div key={folder.id} className="folder-entry">
+                <div className={`folder-row ${view === "chat" && selectedFolder === folder.id ? "active" : ""}`}>
+                  <button className="folder-item" onClick={() => openChat(folder.id)}>
+                    <IconFolder size={17} color="var(--mantine-color-violet-4)" />
+                    <span>{folder.name}</span>
+                    <span className={`folder-status ${folder.scanStatus}`} title={scanLabel(folder.scanStatus)} />
+                  </button>
+                  {editingFolders && <Group gap={0} wrap="nowrap" className="folder-row-actions">
+                    <Tooltip label={`Reindexar ${folder.name}`}><ActionIcon variant="subtle" color="gray" size="sm" aria-label={`Reindexar ${folder.name}`} loading={folder.scanStatus === "scanning"} onClick={() => void scanFolder(folder)}><IconRefresh size={15} /></ActionIcon></Tooltip>
+                    <Tooltip label={`Modificar ${folder.name}`}><ActionIcon variant="subtle" color="gray" size="sm" aria-label={`Modificar ${folder.name}`} onClick={() => editFolderConfiguration(folder)}><IconSettings size={15} /></ActionIcon></Tooltip>
+                  </Group>}
+                </div>
+                {scanProgress[folder.id] && <div className="folder-scan-progress">
+                  <Progress value={scanProgress[folder.id].percent} size={4} radius="xl" color="violet" animated striped />
+                  <Group justify="space-between" gap={6} mt={4} wrap="nowrap">
+                    <Text size="xs" c="dimmed" truncate>
+                      {scanProgress[folder.id].totalFiles === 0
+                        ? "Buscando cambios…"
+                        : scanProgress[folder.id].currentFile || "Finalizando…"}
+                    </Text>
+                    {scanProgress[folder.id].totalFiles > 0 && <Text size="xs" c="dimmed" className="scan-progress-count">
+                      {scanProgress[folder.id].completedFiles}/{scanProgress[folder.id].totalFiles}
+                    </Text>}
+                  </Group>
+                </div>}
               </div>
             ))}
           </Stack>
@@ -542,6 +655,7 @@ function App() {
           <Group gap="xs">
             {view === "chat" && <><Text fw={650}>{activeFolder ? `Chat · ${activeFolder.name}` : "Chat general"}</Text>{activeFolder ? <Tooltip label={activeFolder.lastError || `Estado del análisis: ${scanLabel(activeFolder.scanStatus)}`} multiline w={280}><Badge variant="light" color={scanColor(activeFolder.scanStatus)} size="sm">{scanLabel(activeFolder.scanStatus)}</Badge></Tooltip> : <Badge variant="light" color="gray" size="sm">Sin carpeta</Badge>}</>}
             {view === "analytics" && <Text fw={650}>Actividad y uso</Text>}
+            {view === "knowledge" && <Text fw={650}>Knowledge Logs</Text>}
           </Group>
         </header>
 
@@ -592,6 +706,7 @@ function App() {
         )}
 
         {view === "analytics" && <Analytics />}
+        {view === "knowledge" && <KnowledgeLogs />}
       </main>
 
       <Modal opened={folderModal} onClose={() => { setFolderModal(false); setFolderDraft(null); setConfirmFolderDelete(false); }} title={folderDraft?.id ? "Modificar chat de carpeta" : "Nuevo chat de carpeta"} centered overlayProps={{ backgroundOpacity: 0.65, blur: 5 }}>
@@ -687,6 +802,109 @@ function formatBytes(bytes: number): string {
     unit = units[index];
   }
   return `${value.toFixed(value >= 10 ? 1 : 2)} ${unit}`;
+}
+
+function KnowledgeLogs() {
+  const [logs, setLogs] = useState<KnowledgeLog[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const [editing, setEditing] = useState<KnowledgeLog | null>(null);
+  const [revisedContent, setRevisedContent] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+
+  useEffect(() => {
+    if (!inTauri()) {
+      setLoading(false);
+      return;
+    }
+    let active = true;
+    const load = () => invoke<KnowledgeLog[]>("list_recent_knowledge_logs", { limit: 50 })
+      .then((items) => { if (active) { setLogs(items); setLoadError(""); } })
+      .catch((error) => { if (active) setLoadError(String(error)); })
+      .finally(() => { if (active) setLoading(false); });
+    void load();
+    const timer = window.setInterval(() => void load(), 4_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  const openRevision = (log: KnowledgeLog) => {
+    setEditing(log);
+    setRevisedContent(log.content);
+    setSaveError("");
+  };
+
+  const saveRevision = async () => {
+    if (!editing || !revisedContent.trim() || saving) return;
+    setSaving(true);
+    setSaveError("");
+    try {
+      const content = revisedContent.trim();
+      const embedding = await createEmbedding(content);
+      const updated = await invoke<KnowledgeLog>("revise_knowledge_item", {
+        input: { id: editing.id, content, embedding },
+      });
+      setLogs((current) => current.map((item) => item.id === updated.id ? updated : item));
+      setEditing(null);
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <section className="knowledge-view">
+      <div className="knowledge-container">
+        <div>
+          <Text size="sm" c="violet.3" fw={650}>Memoria persistente</Text>
+          <Title order={2} mt={2}>Knowledge Logs</Title>
+          <Text c="dimmed" size="sm" mt={3}>Últimos conocimientos creados por chats y documentos. Puedes corregir un registro inválido.</Text>
+        </div>
+        <Paper className="knowledge-log-panel">
+          {loading && <Center h="100%"><Loader color="violet" /></Center>}
+          {loadError && <Center h="100%" p="xl"><Text c="red.4" size="sm">{loadError}</Text></Center>}
+          {!loading && !loadError && logs.length === 0 && <Center h="100%" p="xl"><Text c="dimmed" ta="center">Todavía no existen knowledge items.</Text></Center>}
+          {!loading && logs.length > 0 && <ScrollArea className="knowledge-log-scroll">
+            <Stack gap="sm" p="md">
+              {logs.map((log) => (
+                <Card key={log.id} className="knowledge-log-card">
+                  <Group justify="space-between" align="flex-start" wrap="nowrap">
+                    <Group gap={7}>
+                      <Badge variant="light" color={log.scope === "general" ? "gray" : "violet"}>{log.scope === "general" ? "General" : log.folderName || "Carpeta"}</Badge>
+                      <Badge variant="outline" color="gray">{log.sourceType === "document_knowledge" ? "Documento" : "Chat"}</Badge>
+                    </Group>
+                    <Tooltip label="Alertar y corregir conocimiento inválido">
+                      <ActionIcon variant="subtle" color="yellow" aria-label={`Corregir conocimiento ${log.id}`} onClick={() => openRevision(log)}>
+                        <IconAlertTriangle size={17} />
+                      </ActionIcon>
+                    </Tooltip>
+                  </Group>
+                  <Text mt="sm" size="sm" lh={1.65}>{log.content}</Text>
+                  <Group justify="space-between" mt="md" gap="xs">
+                    <Text size="xs" c="dimmed" truncate>{log.documentPath || (log.userInput ? `Prompt: ${log.userInput}` : `Knowledge #${log.id}`)}</Text>
+                    <Text size="xs" c="dimmed" className="knowledge-log-date">{new Date(log.updatedAt).toLocaleString()}</Text>
+                  </Group>
+                </Card>
+              ))}
+            </Stack>
+          </ScrollArea>}
+        </Paper>
+      </div>
+      <Modal opened={editing !== null} onClose={() => !saving && setEditing(null)} title="Corregir conocimiento" centered overlayProps={{ backgroundOpacity: 0.65, blur: 5 }}>
+        <Text size="sm" c="dimmed" mb="md">Al guardar se reemplazarán el contenido, su hash y su embedding. La procedencia del conocimiento se conservará.</Text>
+        <Textarea value={revisedContent} onChange={(event) => setRevisedContent(event.currentTarget.value)} autosize minRows={5} maxRows={12} disabled={saving} />
+        {saveError && <Text size="sm" c="red.4" mt="sm">{saveError}</Text>}
+        <Group justify="space-between" mt="lg">
+          <Button variant="subtle" color="gray" onClick={() => setEditing(null)} disabled={saving}>Cancelar</Button>
+          <Button color="violet" onClick={saveRevision} loading={saving} disabled={!revisedContent.trim()}>Actualizar conocimiento</Button>
+        </Group>
+      </Modal>
+    </section>
+  );
 }
 
 function Analytics() {

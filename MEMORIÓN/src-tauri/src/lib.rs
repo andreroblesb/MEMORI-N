@@ -239,6 +239,8 @@ pub fn run() {
             database::list_knowledge_items,
             database::update_knowledge_item,
             database::delete_knowledge_item,
+            database::list_recent_knowledge_logs,
+            database::revise_knowledge_item,
             database::create_ai_model,
             database::get_ai_model,
             database::list_ai_models,

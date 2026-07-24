@@ -110,6 +110,26 @@ export function extractKnowledge(messages: ChatMessage[]): Promise<KnowledgeExtr
   return postJson<KnowledgeExtraction>("/api/knowledge/extract", { messages });
 }
 
+export async function extractDocumentKnowledge(text: string): Promise<string[]> {
+  const response = await postJson<{ candidates: string[] }>(
+    "/api/knowledge/document/extract",
+    { text },
+  );
+  return response.candidates;
+}
+
+export async function refineKnowledge(
+  candidates: string[],
+  sourceType: "chat" | "document",
+): Promise<string[]> {
+  if (candidates.length === 0) return [];
+  const response = await postJson<{ items: string[] }>("/api/knowledge/refine", {
+    candidates,
+    source_type: sourceType,
+  });
+  return response.items;
+}
+
 export async function extractDocumentChunks(
   path: string,
   extension: string,

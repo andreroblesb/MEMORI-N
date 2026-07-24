@@ -13,10 +13,14 @@ button { font: inherit; }
 .nav-item:hover, .folder-item:hover { background: #1b1c24; color: #f4f4f7; }
 .nav-item.active, .folder-item.active { background: #252130; color: #d9ccff; }
 .folder-row { width: 100%; display: flex; align-items: center; border-radius: 8px; }
+.folder-entry { width: 100%; }
 .folder-row.active { background: #252130; }
 .folder-row .folder-item { min-width: 0; flex: 1; }
 .folder-row-actions { flex: 0 0 auto; padding-right: 3px; }
 .folder-row:has(.folder-row-actions) .folder-item { padding-right: 3px; }
+.folder-scan-progress { padding: 2px 10px 7px 40px; }
+.folder-scan-progress .mantine-Text-root { min-width: 0; }
+.scan-progress-count { flex: 0 0 auto; }
 .shortcut, .folder-count { color: #696b76; font-size: 11px; }
 .folder-status { width: 7px; height: 7px; border-radius: 50%; background: #eab308; box-shadow: 0 0 0 3px rgba(234,179,8,.1); }
 .folder-status.scanning { background: #8b5cf6; box-shadow: 0 0 0 3px rgba(139,92,246,.15); animation: status-pulse 1.2s ease-in-out infinite; }
@@ -68,6 +72,14 @@ button { font: inherit; }
 .folder-card { cursor: pointer; min-height: 160px; transition: .2s ease; }.folder-card:hover { border-color: #594481; transform: translateY(-2px); }
 .chat-row { display: flex; align-items: center; gap: 14px; padding: 14px 16px; border: 1px solid #252731; background: #13141a; cursor: pointer; transition: .18s ease; }.chat-row:hover { background: #181920; border-color: #393b47; }.chat-row-copy { flex: 1; }.row-chevron { transform: rotate(-90deg); color: #737581; }
 .analytics-view { height: calc(100vh - 60px); overflow: hidden; }
+.knowledge-view { height: calc(100vh - 60px); overflow: hidden; }
+.knowledge-container { width: min(900px, calc(100% - 64px)); height: 100%; margin: 0 auto; padding: 28px 0 32px; display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 18px; }
+.knowledge-log-panel { min-height: 0; overflow: hidden; border: 1px solid #292b35; background: rgba(15,16,22,.72); }
+.knowledge-log-scroll { height: 100%; }
+.knowledge-log-card { padding: 15px 17px; border: 1px solid #292b35; background: rgba(20,21,28,.78); }
+.knowledge-log-card:hover { border-color: #3a3548; }
+.knowledge-log-card .mantine-Group-root:last-child .mantine-Text-root:first-child { min-width: 0; flex: 1; }
+.knowledge-log-date { flex: 0 0 auto; }
 .analytics-container { width: min(1100px, calc(100% - 64px)); height: 100%; margin: 0 auto; padding: clamp(20px, 3vh, 32px) 0; display: grid; grid-template-rows: auto auto minmax(0, 1fr); gap: clamp(12px, 2vh, 18px); }
 .metric-card { min-height: 118px; padding: 16px; }.chart-card { min-height: 0; padding: 20px; }
 .analytics-charts { min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, .85fr); gap: 16px; }

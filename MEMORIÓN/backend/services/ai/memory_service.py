@@ -4,7 +4,7 @@ import json
 import math
 import re
 from threading import Lock
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -18,6 +18,23 @@ class KnowledgeExtractionRequest(BaseModel):
 class KnowledgeExtractionResponse(BaseModel):
     should_store: bool
     content: str | None = None
+
+
+class DocumentKnowledgeRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=8_000)
+
+
+class KnowledgeCandidatesResponse(BaseModel):
+    candidates: list[str]
+
+
+class KnowledgeRefinementRequest(BaseModel):
+    candidates: list[str] = Field(min_length=1, max_length=16)
+    source_type: Literal["chat", "document"]
+
+
+class KnowledgeRefinementResponse(BaseModel):
+    items: list[str]
 
 
 class EmbeddingRequest(BaseModel):
@@ -78,6 +95,93 @@ class MemoryAiService:
             should_store=should_store,
             content=content.strip() if should_store and content.strip() else None,
         )
+
+    def extract_document(
+        self, request: DocumentKnowledgeRequest
+    ) -> KnowledgeCandidatesResponse:
+        prompt = (
+            "Extrae del fragmento documental entre 1 y 12 conocimientos candidatos "
+            "útiles para responder preguntas sobre su contenido. Omite encabezados "
+            "aislados, texto de navegación, ruido y repeticiones. Conserva nombres, "
+            "fechas, cantidades, condiciones y relaciones. No inventes información ni "
+            "uses conocimiento externo. Devuelve JSON estricto con esta forma: "
+            '{"candidates":["..."]}. Si no hay contenido informativo devuelve '
+            '{"candidates":[]}.\n\nFragmento:\n' + request.text
+        )
+        parsed = self._json_completion(prompt, max_tokens=700)
+        return KnowledgeCandidatesResponse(
+            candidates=self._clean_items(parsed.get("candidates"), maximum=12)
+        )
+
+    def refine(
+        self, request: KnowledgeRefinementRequest
+    ) -> KnowledgeRefinementResponse:
+        candidates = "\n".join(f"- {item}" for item in request.candidates)
+        prompt = (
+            "Eres la segunda revisión de memoria de MEMORIÓN. Revisa los candidatos "
+            "sin consultar fuentes externas. Puedes conservar, reformular, fusionar o "
+            "dividir. Cada resultado debe ser autocontenido, claro y fiel; debe resolver "
+            "pronombres solo cuando el candidato permita hacerlo. Separa hechos que "
+            "puedan recordarse independientemente, pero no rompas una relación o "
+            "condición inseparable. Elimina duplicados y frases vacías. No agregues "
+            "explicaciones. Devuelve JSON estricto: {\"items\":[\"...\"]}.\n\n"
+            "Ejemplos:\n"
+            "Candidato: El perro del usuario se llama Milo, tiene seis años y consume "
+            "alimento renal desde abril.\n"
+            "Resultado: {\"items\":[\"El perro del usuario se llama Milo.\","
+            "\"Milo tiene seis años.\",\"Milo consume alimento renal desde abril.\"]}\n\n"
+            "Candidato: La reunión será el 14 de agosto a las 10:00 en la sala Norte.\n"
+            "Resultado: {\"items\":[\"La reunión será el 14 de agosto a las 10:00 "
+            "en la sala Norte.\"]}\n\n"
+            "Candidatos: El proyecto usa SQLite. / La persistencia del proyecto usa "
+            "SQLite.\n"
+            "Resultado: {\"items\":[\"El proyecto usa SQLite para persistencia.\"]}\n\n"
+            f"Tipo de fuente: {request.source_type}\nCandidatos:\n{candidates}"
+        )
+        parsed = self._json_completion(prompt, max_tokens=900)
+        items = self._clean_items(parsed.get("items"), maximum=20)
+        if not items:
+            items = self._clean_items(request.candidates, maximum=20)
+        return KnowledgeRefinementResponse(items=items)
+
+    def _json_completion(self, prompt: str, max_tokens: int) -> dict[str, Any]:
+        with self._chat_lock:
+            result = self._chat_model.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=max_tokens,
+                stream=False,
+            )
+        raw = result["choices"][0]["message"]["content"]
+        if not isinstance(raw, str):
+            return {}
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            return {}
+        try:
+            parsed = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _clean_items(value: Any, maximum: int) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        result: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            clean = " ".join(item.split()).strip()
+            key = clean.casefold()
+            if not clean or key in seen:
+                continue
+            seen.add(key)
+            result.append(clean[:2_000])
+            if len(result) >= maximum:
+                break
+        return result
 
     def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
         with self._embedding_lock:

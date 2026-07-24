@@ -36,6 +36,9 @@ Ollama ni envía los documentos a una API de IA externa.
   representación en SQLite.
 - Recuperarse de una indexación interrumpida sin conservar chunks o vectores
   parciales.
+- Consultar los knowledge items recientes en **Knowledge Logs** y corregir
+  manualmente un conocimiento inválido. La corrección regenera también su hash y
+  embedding sin perder la procedencia.
 - Mostrar Markdown, tablas, listas, negritas y otros formatos en las respuestas.
 - Mostrar métricas locales de actividad, archivos y carpetas encontradas.
 - Abrir un formulario de GitHub para reportar comportamientos inesperados.
@@ -137,9 +140,11 @@ versiones y hashes pertenecen al manifest.
 ```text
 Mensaje del usuario
 → clasificación de afirmación
-→ conocimiento autocontenido
-→ embedding
-→ knowledge_item + knowledge_vector
+→ conocimiento candidato
+→ segunda revisión: conservar, reformular, fusionar o dividir
+→ conocimientos autocontenidos
+→ embeddings
+→ knowledge_items + knowledge_vectors
 ```
 
 Las preguntas, saludos y órdenes no deberían guardarse como conocimiento. La
@@ -152,12 +157,19 @@ Archivo admitido
 → parser según extensión
 → texto normalizado
 → chunks con solapamiento
+→ extracción de conocimientos candidatos
+→ segunda revisión semántica
+→ conocimientos autocontenidos
 → embeddings
-→ knowledge_item + knowledge_vector
+→ knowledge_items + knowledge_vectors
 ```
 
 Al hacer una pregunta en un chat de carpeta, MEMORIÓN busca vectores únicamente
-en el alcance de esa carpeta y entrega los chunks relevantes al modelo de chat.
+en el alcance de esa carpeta y entrega los conocimientos relevantes al modelo de
+chat.
+Los conocimientos nacidos del mismo fragmento comparten `document_id` y
+`chunk_index`. Para trazabilidad se conserva el hash del chunk y un extracto
+breve, no una segunda copia completa del texto fuente.
 
 ### Reindexación
 
